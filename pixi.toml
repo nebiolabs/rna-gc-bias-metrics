@@ -1,0 +1,27 @@
+[workspace]
+name = "gc-profile"
+channels = ["conda-forge", "bioconda"]
+platforms = ["osx-arm64", "osx-64", "linux-64"]
+preview = ["pixi-build"]
+
+# Runtime deps from conda-forge / bioconda.
+[dependencies]
+python = ">=3.12"
+numpy = ">=2.3.2"
+polars = ">=1.37.1"
+
+# gc-profile installs editable via uv. polars-bio is PyPI-only, so it lives here
+# rather than in [dependencies].
+[pypi-dependencies]
+gc-profile = { path = ".", editable = true }
+polars-bio = ">=0.31"
+
+[feature.dev.dependencies]
+pytest = ">=9.0"
+
+[environments]
+default = { solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
+
+[feature.dev.tasks]
+test = "pytest test/ -v"

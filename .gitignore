@@ -1,0 +1,13 @@
+# pixi: track pixi.lock for reproducibility, ignore the materialised env
+.pixi/
+
+# build artifacts
+output/
+*.conda
+dist/
+build/
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
