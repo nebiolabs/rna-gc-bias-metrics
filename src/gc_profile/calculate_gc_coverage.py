@@ -11,6 +11,16 @@ import polars_bio as pb
 
 
 def _load_faidx(fp_faidx):
+    '''Read a .fa.fai index into a lazy frame of transcript names and lengths.
+
+    `rname` is cast to an Enum over the file's own name order so downstream
+    joins and category alignment stay consistent.
+
+    Example output:
+        rname             | length
+        ENST00000227525.8 | 2129
+        ENST00000536171.1 | 1959
+    '''
     faidx = pl.read_csv(
         fp_faidx,
         separator = '\t',
@@ -29,6 +39,15 @@ def _load_faidx(fp_faidx):
 
 
 def _load_fasta(fp_fasta, transcript_categories=None):
+    '''Read an unwrapped (single-line-sequence) FASTA into a lazy frame.
+
+    When `transcript_categories` is given, `rname` is cast to a matching Enum.
+
+    Example output:
+        rname             | seq
+        ENST00000227525.8 | ATCCCGCCTTGCGCATGCGG…
+        ENST00000536171.1 | CCTGGCAGACCCAGTCATGG…
+    '''
     if transcript_categories is not None:
         schema_overrides = {'rname': pl.Enum(transcript_categories)}
     else:
@@ -55,7 +74,7 @@ def _load_fasta(fp_fasta, transcript_categories=None):
 
 
 def load_sequences(fp_fasta, fp_faidx):
-    '''Loads faidx and fasta, aligning categories, and returns both dataframes.'''
+    '''Load the faidx and FASTA, aligning `rname` categories, and return both.'''
     faidx = _load_faidx(fp_faidx)
     transcript_categories = faidx.select(pl.col('rname').cat.get_categories()).collect()
     sequences = _load_fasta(fp_fasta, transcript_categories=transcript_categories)
@@ -63,6 +82,19 @@ def load_sequences(fp_fasta, fp_faidx):
 
 
 def load_bam(fp_bam, transcript_categories=None):
+    '''Read a BAM into a lazy frame with SAM-style columns, flags, and R1/R2 side.
+
+    Scans `fp_bam` via polars-bio, drops unmapped/secondary/supplementary reads
+    (exclude_flags=2308), renames columns to the SAM spec, and adds a `FREVERSE`
+    boolean plus an R1/R2 `side` label. When `transcript_categories` is given,
+    `RNAME` is validated against it (raising if the BAM references sequences
+    absent from the FASTA index) and cast to a matching Enum.
+
+    Example output:
+        QNAME         | FLAG | RNAME             | POS  | MPOS | CIGAR | ISIZE | FREVERSE | side
+        M05473…:12904 | 675  | ENST00000227525.8 | 1451 | 1475 | 75M   | 99    | false    | R2
+        M05473…:12904 | 595  | ENST00000227525.8 | 1475 | 1451 | 75M   | -99   | true     | R1
+    '''
     # from dict(pysam.SAM_FLAGS.__members__), but not worth rest of pysam dependency
     sam_flags = {
         "FPAIRED":1,
@@ -148,6 +180,26 @@ def load_bam(fp_bam, transcript_categories=None):
 
 
 def expand_cigar(bam_df):
+    '''Explode each alignment's CIGAR into one row per reference-consuming match run.
+
+    Keeps only match ops (M/X/=), computes each run's reference span
+    (`cigar_start`/`cigar_end`), and deduplicates paired-end overlap by capping
+    the left mate's end at the mate start (`cigar_end_dedup`) and dropping runs
+    that fall entirely past it. Input alignment columns are carried through.
+
+    Example output:
+        QNAME         | FLAG | RNAME             | POS  | MPOS
+        M05473…:12904 | 675  | ENST00000227525.8 | 1451 | 1475
+        M05473…:12904 | 595  | ENST00000227525.8 | 1475 | 1451
+
+        ISIZE | FREVERSE | side | cigar_length | cigar_pos_offset
+        99    | false    | R2   | 75           | 0
+        -99   | true     | R1   | 75           | 0
+
+        is_left_mate | cigar_start | cigar_end | cigar_end_dedup
+        true         | 1451        | 1526      | 1475
+        false        | 1475        | 1550      | 1550
+    '''
     expanded_cigar_df = bam_df.with_row_index(
     ).with_columns(
         pl.col('CIGAR').str.extract_all(
@@ -171,7 +223,7 @@ def expand_cigar(bam_df):
         ['CIGAR','cigar_part', 'index', 'cigar_op']
     )
 
-    # Remove double counted bases (see below for method development)
+    # Remove double counted bases
     expanded_cigar_df = expanded_cigar_df.with_columns(
         is_left_mate = pl.col('POS') < pl.col('MPOS'),
         cigar_start  = pl.col('POS') + pl.col('cigar_pos_offset'),
@@ -192,6 +244,17 @@ def expand_cigar(bam_df):
 
 
 def bam_to_bedgraph(expanded_cigar_df):
+    '''Collapse CIGAR match runs into a per-range coverage bedgraph.
+
+    Groups runs by (rname, start, end) and counts them as `depth`. `start` is
+    shifted to 0-based (BED convention); note `end` is left as the 1-based
+    one-past-end coordinate (a known off-by-one — see the exact-end-coord tests).
+
+    Example output:
+        rname             | start | end  | depth
+        ENST00000227525.8 | 1450  | 1475 | 1
+        ENST00000227525.8 | 1474  | 1550 | 1
+    '''
     #  BED files are 0 indexed and start-inclusive/end-exclusive
     #  SAM files are 1 indexed
     #  NOTE: bams are actually 0 indexed, while sam files are 1 indexed
@@ -213,6 +276,18 @@ def bam_to_bedgraph(expanded_cigar_df):
 
 
 def get_binned_coverage(bg, fixed_length_bin_bp, faidx):
+    '''Redistribute bedgraph coverage into fixed-length (bp) bins per transcript.
+
+    Splits each coverage range across the bins it overlaps, weighting partial
+    bins by their covered fraction, then sums `depth_fractional` per
+    (rname, bin_start). `fixed_length_bin_bp` sets the bin size and `faidx`
+    supplies transcript lengths.
+
+    Example output:
+        rname             | bin_start | depth_fractional
+        ENST00000227525.8 | 1400.0    | 0.51
+        ENST00000227525.8 | 1500.0    | 0.5
+    '''
     binning_type = 'fixed_length'   # One of ['fixed_length', 'fixed_n_bins']
 
     if binning_type == 'fixed_length':
@@ -303,6 +378,17 @@ def get_binned_coverage(bg, fixed_length_bin_bp, faidx):
 
 
 def get_bin_gc(bin_cov, fixed_length_bin_bp, sequences):
+    '''Attach per-bin GC fraction and within-transcript normalized depth.
+
+    Computes each bin's GC fraction from the transcript sequence, joins it onto
+    the binned coverage, and adds `depth_normalized` (bin depth over the
+    transcript mean bin depth) and `gc_frac_rounded` (GC rounded to 2 dp).
+
+    Example output:
+        rname             | bin_start | depth_fractional | gc_frac | depth_normalized | gc_frac_rounded
+        ENST00000227525.8 | 1400      | 0.51             | 0.59    | 1.009901         | 0.59
+        ENST00000227525.8 | 1500      | 0.5              | 0.47    | 0.990099         | 0.47
+    '''
     bin_gc = sequences.join(
         bin_cov.select(pl.col('rname')).unique(),
         on='rname'
@@ -337,6 +423,12 @@ def get_bin_gc(bin_cov, fixed_length_bin_bp, sequences):
 
 
 def plot(bin_cov_with_gc):
+    '''Build a stacked hvplot layout of GC-bias coverage and bin count vs GC.
+
+    Returns a HoloViews layout: mean `depth_normalized` over `gc_frac_rounded`
+    above a line of per-GC bin counts. Intended for interactive/notebook use
+    (not part of the CLI path).
+    '''
     lineplot = bin_cov_with_gc.group_by(
         'gc_frac_rounded'
     ).agg(
@@ -360,6 +452,7 @@ def plot(bin_cov_with_gc):
 
 
 def calculate_gc_coverage(fp_bam, sequences, faidx, fixed_length_bin_bp=100):
+    '''Run the full BAM→binned GC-vs-coverage pipeline for one BAM.'''
     transcript_categories = faidx.select(pl.col('rname').cat.get_categories()).collect()
     bam_df = load_bam(fp_bam, transcript_categories=transcript_categories)
     expanded_cigar_df = expand_cigar(bam_df)
@@ -371,6 +464,13 @@ def calculate_gc_coverage(fp_bam, sequences, faidx, fixed_length_bin_bp=100):
 
 
 def calculate_gc_pct_coverage(bin_cov_with_gc):
+    '''Average normalized depth per rounded GC fraction across all bins.
+
+    Example output:
+        gc_frac_rounded | depth_normalized
+        0.47            | 0.990099
+        0.59            | 1.009901
+    '''
     return bin_cov_with_gc.group_by(
         'gc_frac_rounded'
     ).agg(
@@ -379,6 +479,13 @@ def calculate_gc_pct_coverage(bin_cov_with_gc):
 
 
 def calculate_gc_pct_frequency(bin_cov_with_gc):
+    '''Count how many covered bins fall in each rounded GC fraction.
+
+    Example output:
+        gc_frac_rounded | count
+        0.47            | 1
+        0.59            | 1
+    '''
     return bin_cov_with_gc.group_by(
         'gc_frac_rounded'
     ).agg(
@@ -387,6 +494,13 @@ def calculate_gc_pct_frequency(bin_cov_with_gc):
 
 
 def calculate_gc_pct_frequency_across_full_transcriptome(sequences, fixed_length_bin_bp):
+    '''Count bins per rounded GC fraction across every transcript's full sequence.
+
+    Example output:
+        gc_frac_rounded | count_bins_full_transcriptome
+        0.24            | 1
+        0.25            | 1
+    '''
     return sequences.with_columns(
         pl.int_ranges(pl.col('seq').str.len_chars(), step=fixed_length_bin_bp).alias('start')
     ).explode(
