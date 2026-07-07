@@ -24,6 +24,18 @@ TRANSCRIPTS = ['ENST00000227525.8', 'ENST00000536171.1', 'ENST00000540280.1', 'E
 TRANSCRIPT_LENGTHS = {'ENST00000227525.8': 2129, 'ENST00000536171.1': 1959, 'ENST00000540280.1': 724, 'ENST00000438571.5': 792}
 BIN_BP = 100
 
+# Shared reference for the exact bin-coordinate tests (see TestExactBinCoordinates):
+# 20bp = two 10bp homopolymer blocks (bin 0 all-A/0% GC, bin 1 all-G/100% GC).
+EXACT_COORD_FASTA = os.path.join(FIXTURES, 'fasta', 'test_exact_coord.fa')
+EXACT_COORD_FAIDX = os.path.join(FIXTURES, 'fasta', 'test_exact_coord.fa.fai')
+EXACT_COORD_BIN_BP = 10
+
+# One single-read BAM per scenario, both against the shared reference above:
+# END_COORD_BAM's read ends at a bin boundary; START_COORD_BAM's read starts at
+# the first G (start of bin 1).
+END_COORD_BAM = os.path.join(FIXTURES, 'bam', 'test_exact_end_coord.bam')
+START_COORD_BAM = os.path.join(FIXTURES, 'bam', 'test_exact_start_coord.bam')
+
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -306,3 +318,81 @@ class TestCalculateGcPctFrequency:
         result = calculate_gc_pct_frequency(bin_cov_with_gc).collect().sort('gc_frac_rounded')
         assert result['gc_frac_rounded'].to_list() == [0.47, 0.59, 0.65, 0.68, 0.70, 0.77]
         assert result['count'].to_list() == [1, 1, 1, 1, 1, 1]
+
+
+# ---------------------------------------------------------------------------
+# 11. Exact bin-coordinate handling
+# ---------------------------------------------------------------------------
+class TestExactBinCoordinates:
+    """Exact placement of a read's coverage relative to bin boundaries, on a
+    purpose-built reference where bin 0 is 0% GC ("AAAAAAAAAA") and bin 1 is 100%
+    GC ("GGGGGGGGGG"), with a 10 bp bin size -- so any coverage landing in the
+    wrong bin surfaces as spurious GC signal. Two single-read fixtures are used:
+    one at 1-based POS=1 covering exactly 0-based [0, 10) (all of bin 0, confirmed
+    by `bedtools bamtobed`, which reports `chrDemo 0 10`), and one at POS=11 that
+    starts exactly at bin 1.
+    """
+
+    @pytest.fixture(scope="class")
+    def seqs_faidx(self):
+        return load_sequences(EXACT_COORD_FASTA, EXACT_COORD_FAIDX)
+
+    @pytest.fixture(scope="class")
+    def pipeline(self, seqs_faidx):
+        """Returns (bedgraph LazyFrame, collected+sorted get_bin_gc result)."""
+        sequences, faidx = seqs_faidx
+        transcript_categories = faidx.select(pl.col('rname').cat.get_categories()).collect()
+        bam = load_bam(END_COORD_BAM, transcript_categories=transcript_categories)
+        bg = bam_to_bedgraph(expand_cigar(bam))
+        bin_cov = get_binned_coverage(bg, EXACT_COORD_BIN_BP, faidx)
+        bin_cov_with_gc = get_bin_gc(bin_cov, EXACT_COORD_BIN_BP, sequences).collect().sort('bin_start')
+        return bg, bin_cov_with_gc
+
+    def test_read_fills_its_own_bin(self, pipeline):
+        """Bin 0 -- the read's true span, 0% GC -- receives the read's full depth."""
+        _, bin_cov_with_gc = pipeline
+        row = bin_cov_with_gc.filter(pl.col('bin_start') == 0).row(0, named=True)
+        assert row['gc_frac'] == 0.0
+        assert abs(row['depth_fractional'] - 1.0) < 1e-12
+
+    @pytest.mark.xfail(strict=True, reason=(
+        "Known off-by-one: bam_to_bedgraph leaves `end` as the 1-based one-past-end "
+        "coordinate instead of shifting it to 0-based like `start`, so end is 11 not "
+        "10. Remove this marker once the -1 offset is applied to `end`."
+    ))
+    def test_bedgraph_end_is_zero_based_exclusive(self, pipeline):
+        """bedtools bamtobed reports the read as 0-based [0, 10), so the bedgraph
+        end must be 10."""
+        bg, _ = pipeline
+        row = bg.filter(pl.col('start') == 0).collect().row(0, named=True)
+        assert row['end'] == 10
+
+    @pytest.mark.xfail(strict=True, reason=(
+        "Known off-by-one in bam_to_bedgraph `end` leaks 0.1 depth into bin 1 "
+        "(100% GC), a region the read never overlaps. Remove this marker once the "
+        "-1 offset is applied to `end`."
+    ))
+    def test_no_coverage_leaks_past_read_span(self, pipeline):
+        """The read lies entirely in bin 0, so the 100% GC bin at bin_start 10
+        carries no coverage: it is either absent from the output or present with
+        zero depth (both encode 'no coverage in this bin')."""
+        _, bin_cov_with_gc = pipeline
+        bin_past_read = bin_cov_with_gc.filter(pl.col('bin_start') == 10)
+        assert bin_past_read.is_empty() or (bin_past_read['depth_fractional'] == 0).all()
+
+    @pytest.fixture(scope="class")
+    def start_coord_bin_cov_with_gc(self, seqs_faidx):
+        """get_bin_gc result for a single 10bp read starting at the first G (bin 1)."""
+        sequences, faidx = seqs_faidx
+        transcript_categories = faidx.select(pl.col('rname').cat.get_categories()).collect()
+        bam = load_bam(START_COORD_BAM, transcript_categories=transcript_categories)
+        bin_cov = get_binned_coverage(bam_to_bedgraph(expand_cigar(bam)), EXACT_COORD_BIN_BP, faidx)
+        return get_bin_gc(bin_cov, EXACT_COORD_BIN_BP, sequences).collect().sort('bin_start')
+
+    def test_read_starting_at_bin_boundary_fills_that_bin(self, start_coord_bin_cov_with_gc):
+        """A 10bp read starting at the first G (1-based POS=11 = start of bin 1)
+        fully covers bin 1 -- the 100% GC bin at bin_start 10 -- with the read's
+        full depth."""
+        row = start_coord_bin_cov_with_gc.filter(pl.col('bin_start') == 10).row(0, named=True)
+        assert row['gc_frac'] == 1.0
+        assert abs(row['depth_fractional'] - 1.0) < 1e-12
