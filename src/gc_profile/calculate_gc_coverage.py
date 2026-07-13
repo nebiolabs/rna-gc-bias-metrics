@@ -490,7 +490,7 @@ def calculate_gc_pct_frequency(bin_cov_with_gc):
         'gc_frac_rounded'
     ).agg(
         pl.len().alias('count')
-    )
+    ).sort('gc_frac_rounded')
 
 
 def calculate_gc_pct_frequency_across_full_transcriptome(sequences, fixed_length_bin_bp):
