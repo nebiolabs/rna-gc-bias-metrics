@@ -36,6 +36,16 @@ EXACT_COORD_BIN_BP = 10
 END_COORD_BAM = os.path.join(FIXTURES, 'bam', 'test_exact_end_coord.bam')
 START_COORD_BAM = os.path.join(FIXTURES, 'bam', 'test_exact_start_coord.bam')
 
+# Overlapping pair on the shared exact-coord reference (chrDemo): left mate spans
+# 1-based 1-10, right mate 6-15, overlap 6-10 -- for TestExactBinCoordinates.
+PAIR_OVERLAP_BAM = os.path.join(FIXTURES, 'bam', 'test_pair_overlap.bam')
+
+# 120bp reference (chrPair) carrying one read pair per dedup scenario at a
+# distinct locus -- for TestPairDeduplication.
+PAIR_DEDUP_FASTA = os.path.join(FIXTURES, 'fasta', 'test_pair_dedup.fa')
+PAIR_DEDUP_FAIDX = os.path.join(FIXTURES, 'fasta', 'test_pair_dedup.fa.fai')
+PAIR_DEDUP_BAM = os.path.join(FIXTURES, 'bam', 'test_pair_dedup.bam')
+
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -396,3 +406,118 @@ class TestExactBinCoordinates:
         row = start_coord_bin_cov_with_gc.filter(pl.col('bin_start') == 10).row(0, named=True)
         assert row['gc_frac'] == 1.0
         assert abs(row['depth_fractional'] - 1.0) < 1e-12
+
+    @pytest.fixture(scope="class")
+    def overlap_pair(self, seqs_faidx):
+        """(expand_cigar, get_bin_gc) for an overlapping pair on chrDemo."""
+        sequences, faidx = seqs_faidx
+        transcript_categories = faidx.select(pl.col('rname').cat.get_categories()).collect()
+        bam = load_bam(PAIR_OVERLAP_BAM, transcript_categories=transcript_categories)
+        expanded = expand_cigar(bam).collect()
+        bin_cov = get_binned_coverage(bam_to_bedgraph(expand_cigar(bam)), EXACT_COORD_BIN_BP, faidx)
+        bin_cov_with_gc = get_bin_gc(bin_cov, EXACT_COORD_BIN_BP, sequences).collect()
+        return expanded, bin_cov_with_gc
+
+    def test_overlapping_pair_left_mate_trimmed(self, overlap_pair):
+        """The left mate's run is trimmed to the mate start (cigar_end_dedup == MPOS)
+        while the right mate is kept whole, so the overlap is ceded to one mate."""
+        expanded, _ = overlap_pair
+        left = expanded.filter(pl.col('is_left_mate')).row(0, named=True)
+        assert left['cigar_end'] == 11
+        assert left['cigar_end_dedup'] == left['MPOS'] == 6
+        right = expanded.filter(~pl.col('is_left_mate')).row(0, named=True)
+        assert right['cigar_end_dedup'] == right['cigar_end'] == 16
+
+    @pytest.mark.xfail(strict=True, reason=(
+        "bam_to_bedgraph leaves `end` 1-based (the known off-by-one), so each mate's "
+        "range is 1bp too long and the trimmed seam base is double-counted: the "
+        "deduplicated coverage sums to 1.7 bins instead of the 15 unique bases (1.5). "
+        "Remove this marker once the -1 offset is applied to `end`."
+    ))
+    def test_overlapping_pair_counts_each_base_once(self, overlap_pair):
+        """The pair covers 15 distinct reference bases (1-based 1-15), so the total
+        deduplicated coverage must equal 15 bases == 1.5 bins at 10bp."""
+        _, bin_cov_with_gc = overlap_pair
+        assert bin_cov_with_gc['depth_fractional'].sum() == pytest.approx(1.5)
+
+
+# ---------------------------------------------------------------------------
+# 12. Paired-end deduplication (structural + defect cases)
+# ---------------------------------------------------------------------------
+class TestPairDeduplication:
+    """Mate-overlap dedup in expand_cigar across CIGAR shapes and edge cases, on a
+    120bp reference (chrPair) carrying one read pair per scenario at a distinct
+    locus (see the test_pair_dedup fixture)."""
+
+    @pytest.fixture(scope="class")
+    def seqs_faidx(self):
+        return load_sequences(PAIR_DEDUP_FASTA, PAIR_DEDUP_FAIDX)
+
+    @pytest.fixture(scope="class")
+    def dedup_expanded(self, seqs_faidx):
+        _, faidx = seqs_faidx
+        transcript_categories = faidx.select(pl.col('rname').cat.get_categories()).collect()
+        bam = load_bam(PAIR_DEDUP_BAM, transcript_categories=transcript_categories)
+        return expand_cigar(bam).collect()
+
+    @pytest.fixture(scope="class")
+    def dedup_bg(self, seqs_faidx):
+        _, faidx = seqs_faidx
+        transcript_categories = faidx.select(pl.col('rname').cat.get_categories()).collect()
+        bam = load_bam(PAIR_DEDUP_BAM, transcript_categories=transcript_categories)
+        return bam_to_bedgraph(expand_cigar(bam)).collect()
+
+    def test_left_run_beginning_at_mate_start_is_dropped(self, dedup_expanded):
+        """A left-mate CIGAR run beginning at or after the mate start is dropped (the
+        right mate is assumed to cover that region): the 5M5D5M left mate keeps only
+        its first run, and the run past MPOS is gone."""
+        left = dedup_expanded.filter((pl.col('QNAME') == 'multirun') & pl.col('is_left_mate'))
+        assert left.height == 1
+        assert left['cigar_start'].to_list() == [1]
+
+    def test_left_mate_ending_at_mate_start_not_trimmed(self, dedup_expanded):
+        """A left mate whose run ends exactly at the mate start (cigar_end == MPOS) is
+        not trimmed; the cap applies only when cigar_end strictly exceeds MPOS."""
+        left = dedup_expanded.filter(
+            (pl.col('QNAME') == 'boundary') & pl.col('is_left_mate')
+        ).row(0, named=True)
+        assert left['cigar_end_dedup'] == left['cigar_end'] == 51
+
+    @pytest.mark.xfail(strict=True, reason=(
+        "Mates that start at the same position (POS == MPOS) are both classified as "
+        "right mates (is_left_mate uses strict <), so neither is trimmed and the "
+        "shared span is counted twice (depth 2). There is no tie-breaker to pick a "
+        "left mate. Remove this marker once equal-start pairs are deduplicated."
+    ))
+    def test_equal_start_pair_not_double_counted(self, dedup_bg):
+        """Fully-overlapping mates that start at the same position must count each
+        base once (depth 1)."""
+        equalstart = dedup_bg.filter(pl.col('start') == 70).row(0, named=True)
+        assert equalstart['depth'] == 1
+
+    @pytest.mark.xfail(strict=True, reason=(
+        "Dovetail/read-through (left mate extends past the right mate's end): capping "
+        "the left mate at MPOS discards its tail beyond the right mate. This is an "
+        "accepted limitation -- such pairs are rare after adapter trimming and it is "
+        "not planned for a fix; strict xfail flags any accidental behavior change."
+    ))
+    def test_dovetail_left_tail_retained(self, dedup_bg):
+        """The left mate reaches 1-based reference base 110; its coverage past the
+        right mate's end must be retained (max bedgraph end reaches 111)."""
+        # Bound the upper end to the dovetail locus: the single-end read sits at
+        # bedgraph start 114 and would otherwise be pulled into a bare start>=90
+        # slice, making its end (120) the max instead of the dovetail tail.
+        dovetail = dedup_bg.filter((pl.col('start') >= 90) & (pl.col('start') < 114))
+        assert dovetail['end'].max() == 111
+
+    @pytest.mark.xfail(strict=True, reason=(
+        "A mateless read has null MPOS; `POS < null` is null, and the dedup filter "
+        "keeps only rows evaluating True, so the read is dropped. Single-end / "
+        "mate-unmapped reads are silently lost (the upstream flag filter does not "
+        "exclude them -- flag 8 is absent from exclude_flags=2308). Remove this "
+        "marker once mateless reads are retained."
+    ))
+    def test_single_end_read_retained(self, dedup_expanded):
+        """A read with no mate (null MPOS) should still contribute its own coverage
+        rather than being dropped."""
+        assert dedup_expanded.filter(pl.col('QNAME') == 'singleend').height >= 1
