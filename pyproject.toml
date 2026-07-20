@@ -5,8 +5,10 @@ build-backend = "uv_build"
 [project]
 name = "gc-profile"
 version = "0.1.0"
-description = "Add your description here"
+description = "A tool to calculate the GC bias profile of RNAseq data."
+authors = [{name = "Gautam Naishadham"}]
 readme = "README.md"
+license-files = ["LICENSE.txt"]
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.3.2",
