@@ -210,8 +210,8 @@ class TestBamToBedgraph:
             'depth': [1, 1, 1, 1],
         }).cast({
             'rname': pl.Enum(TRANSCRIPTS),
-            'start': pl.Int64,
-            'end': pl.Int64,
+            'start': pl.UInt32,
+            'end': pl.UInt32,
             'depth': pl.UInt32,
         }).sort('rname', 'start')
         assert_frame_equal(df, expected)

@@ -261,12 +261,10 @@ def bam_to_bedgraph(expanded_cigar_df):
     #  NOTE: bams are actually 0 indexed, while sam files are 1 indexed
     #    polars-bio is read with use_zero_based=False, so POS follows the SAM
     #    spec (and Noodles) and uses 1-based coordinates.
-    bed_bam_offset = pl.lit(-1).cast(pl.Int32)
-
     bg = expanded_cigar_df.select(    # Create bedgraph
         pl.col('RNAME').alias('rname'),
-        pl.col('cigar_start').alias('start') + bed_bam_offset,
-        pl.col('cigar_end_dedup').alias('end') + bed_bam_offset
+        pl.col('cigar_start').alias('start') - pl.lit(1).cast(pl.UInt32),
+        pl.col('cigar_end_dedup').alias('end') - pl.lit(1).cast(pl.UInt32)
     ).group_by(
         'rname','start','end'
     ).agg(
