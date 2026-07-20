@@ -185,7 +185,10 @@ def expand_cigar(bam_df):
     Keeps only match ops (M/X/=), computes each run's reference span
     (`cigar_start`/`cigar_end`), and deduplicates paired-end overlap by capping
     the left mate's end at the mate start (`cigar_end_dedup`) and dropping runs
-    that fall entirely past it. Input alignment columns are carried through.
+    that fall entirely past it. The left mate is the mate with the smaller POS;
+    equal-start pairs (POS == MPOS) are tie-broken by treating R1 as the left
+    mate so their shared span is counted once. Input alignment columns are
+    carried through.
 
     Example output:
         QNAME         | FLAG | RNAME             | POS  | MPOS
@@ -225,7 +228,13 @@ def expand_cigar(bam_df):
 
     # Remove double counted bases
     expanded_cigar_df = expanded_cigar_df.with_columns(
-        is_left_mate = pl.col('POS') < pl.col('MPOS'),
+        # The left mate (smaller POS) cedes the overlap to the right mate. When
+        # both mates start at the same position (POS == MPOS, fully overlapping),
+        # `<` alone leaves neither as the left mate and the shared span is counted
+        # twice, so break the tie on `side`: R1 becomes the left mate and is
+        # dropped, leaving R2 to cover the region once.
+        is_left_mate = (pl.col('POS') < pl.col('MPOS'))
+            | ((pl.col('POS') == pl.col('MPOS')) & (pl.col('side') == 'R1')),
         cigar_start  = pl.col('POS') + pl.col('cigar_pos_offset'),
         cigar_end    = pl.col('POS') + pl.col('cigar_pos_offset') + pl.col('cigar_length')
     ).filter(   # First, remove leftmate cigar parts completely overlapping rightmate

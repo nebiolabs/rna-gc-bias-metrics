@@ -467,12 +467,6 @@ class TestPairDeduplication:
         ).row(0, named=True)
         assert left['cigar_end_dedup'] == left['cigar_end'] == 51
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "Mates that start at the same position (POS == MPOS) are both classified as "
-        "right mates (is_left_mate uses strict <), so neither is trimmed and the "
-        "shared span is counted twice (depth 2). There is no tie-breaker to pick a "
-        "left mate. Remove this marker once equal-start pairs are deduplicated."
-    ))
     def test_equal_start_pair_not_double_counted(self, dedup_bg):
         """Fully-overlapping mates that start at the same position must count each
         base once (depth 1)."""
