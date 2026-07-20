@@ -246,14 +246,15 @@ def expand_cigar(bam_df):
 def bam_to_bedgraph(expanded_cigar_df):
     '''Collapse CIGAR match runs into a per-range coverage bedgraph.
 
-    Groups runs by (rname, start, end) and counts them as `depth`. `start` is
-    shifted to 0-based (BED convention); note `end` is left as the 1-based
-    one-past-end coordinate (a known off-by-one — see the exact-end-coord tests).
+    Groups runs by (rname, start, end) and counts them as `depth`. Both `start`
+    and `end` are shifted from the 1-based SAM coordinates to 0-based, so each
+    range is a half-open BED interval [start, end) (start-inclusive,
+    end-exclusive).
 
     Example output:
         rname             | start | end  | depth
-        ENST00000227525.8 | 1450  | 1475 | 1
-        ENST00000227525.8 | 1474  | 1550 | 1
+        ENST00000227525.8 | 1450  | 1474 | 1
+        ENST00000227525.8 | 1474  | 1549 | 1
     '''
     #  BED files are 0 indexed and start-inclusive/end-exclusive
     #  SAM files are 1 indexed
@@ -265,7 +266,7 @@ def bam_to_bedgraph(expanded_cigar_df):
     bg = expanded_cigar_df.select(    # Create bedgraph
         pl.col('RNAME').alias('rname'),
         pl.col('cigar_start').alias('start') + bed_bam_offset,
-        pl.col('cigar_end_dedup').alias('end')
+        pl.col('cigar_end_dedup').alias('end') + bed_bam_offset
     ).group_by(
         'rname','start','end'
     ).agg(
@@ -285,8 +286,8 @@ def get_binned_coverage(bg, fixed_length_bin_bp, faidx):
 
     Example output:
         rname             | bin_start | depth_fractional
-        ENST00000227525.8 | 1400.0    | 0.51
-        ENST00000227525.8 | 1500.0    | 0.5
+        ENST00000227525.8 | 1400.0    | 0.5
+        ENST00000227525.8 | 1500.0    | 0.49
     '''
     binning_type = 'fixed_length'   # One of ['fixed_length', 'fixed_n_bins']
 
@@ -386,8 +387,8 @@ def get_bin_gc(bin_cov, fixed_length_bin_bp, sequences):
 
     Example output:
         rname             | bin_start | depth_fractional | gc_frac | depth_normalized | gc_frac_rounded
-        ENST00000227525.8 | 1400      | 0.51             | 0.59    | 1.009901         | 0.59
-        ENST00000227525.8 | 1500      | 0.5              | 0.47    | 0.990099         | 0.47
+        ENST00000227525.8 | 1400      | 0.5              | 0.59    | 1.010101         | 0.59
+        ENST00000227525.8 | 1500      | 0.49             | 0.47    | 0.989899         | 0.47
     '''
     bin_gc = sequences.join(
         bin_cov.select(pl.col('rname')).unique(),
@@ -468,8 +469,8 @@ def calculate_gc_pct_coverage(bin_cov_with_gc):
 
     Example output:
         gc_frac_rounded | depth_normalized
-        0.47            | 0.990099
-        0.59            | 1.009901
+        0.47            | 0.989899
+        0.59            | 1.010101
     '''
     return bin_cov_with_gc.group_by(
         'gc_frac_rounded'

@@ -206,12 +206,12 @@ class TestBamToBedgraph:
         expected = pl.DataFrame({
             'rname': ['ENST00000227525.8', 'ENST00000227525.8', 'ENST00000438571.5', 'ENST00000438571.5'],
             'start': [1450, 1474, 35, 232],
-            'end':   [1475, 1550, 111, 308],
+            'end':   [1474, 1549, 110, 307],
             'depth': [1, 1, 1, 1],
         }).cast({
             'rname': pl.Enum(TRANSCRIPTS),
             'start': pl.Int64,
-            'end': pl.UInt32,
+            'end': pl.Int64,
             'depth': pl.UInt32,
         }).sort('rname', 'start')
         assert_frame_equal(df, expected)
@@ -235,7 +235,7 @@ class TestGetBinnedCoverage:
             'ENST00000438571.5', 'ENST00000438571.5', 'ENST00000438571.5', 'ENST00000438571.5',
         ]
         assert df['bin_start'].to_list() == [1400.0, 1500.0, 0.0, 100.0, 200.0, 300.0]
-        expected = [0.51, 0.5, 0.65, 0.11, 0.68, 0.08]
+        expected = [0.5, 0.49, 0.65, 0.1, 0.68, 0.07]
         for actual, exp in zip(df['depth_fractional'].to_list(), expected):
             assert abs(actual - exp) < 1e-10
 
@@ -259,7 +259,7 @@ class TestGetBinGc:
     def test_depth_normalized_values(self, bin_cov_with_gc):
         df = bin_cov_with_gc.collect().sort('rname', 'bin_start')
         values = df['depth_normalized'].to_list()
-        expected = [1.009901, 0.990099, 1.710526, 0.289474, 1.789474, 0.210526]
+        expected = [1.010101, 0.989899, 1.733333, 0.266667, 1.813333, 0.186667]
         for actual, exp in zip(values, expected):
             assert abs(actual - exp) < 1e-4
 
@@ -307,7 +307,7 @@ class TestCalculateGcPctCoverage:
     def test_exact_values(self, bin_cov_with_gc):
         result = calculate_gc_pct_coverage(bin_cov_with_gc).collect().sort('gc_frac_rounded')
         assert result['gc_frac_rounded'].to_list() == [0.47, 0.59, 0.65, 0.68, 0.70, 0.77]
-        expected_depths = [0.990099, 1.009901, 1.789474, 0.289474, 0.210526, 1.710526]
+        expected_depths = [0.989899, 1.010101, 1.813333, 0.266667, 0.186667, 1.733333]
         for actual, exp in zip(result['depth_normalized'].to_list(), expected_depths):
             assert abs(actual - exp) < 1e-4
 
@@ -365,11 +365,6 @@ class TestExactBinCoordinates:
         assert row['gc_frac'] == 0.0
         assert abs(row['depth_fractional'] - 1.0) < 1e-12
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "Known off-by-one: bam_to_bedgraph leaves `end` as the 1-based one-past-end "
-        "coordinate instead of shifting it to 0-based like `start`, so end is 11 not "
-        "10. Remove this marker once the -1 offset is applied to `end`."
-    ))
     def test_bedgraph_end_is_zero_based_exclusive(self, pipeline):
         """bedtools bamtobed reports the read as 0-based [0, 10), so the bedgraph
         end must be 10."""
@@ -377,11 +372,6 @@ class TestExactBinCoordinates:
         row = bg.filter(pl.col('start') == 0).collect().row(0, named=True)
         assert row['end'] == 10
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "Known off-by-one in bam_to_bedgraph `end` leaks 0.1 depth into bin 1 "
-        "(100% GC), a region the read never overlaps. Remove this marker once the "
-        "-1 offset is applied to `end`."
-    ))
     def test_no_coverage_leaks_past_read_span(self, pipeline):
         """The read lies entirely in bin 0, so the 100% GC bin at bin_start 10
         carries no coverage: it is either absent from the output or present with
@@ -428,12 +418,6 @@ class TestExactBinCoordinates:
         right = expanded.filter(~pl.col('is_left_mate')).row(0, named=True)
         assert right['cigar_end_dedup'] == right['cigar_end'] == 16
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "bam_to_bedgraph leaves `end` 1-based (the known off-by-one), so each mate's "
-        "range is 1bp too long and the trimmed seam base is double-counted: the "
-        "deduplicated coverage sums to 1.7 bins instead of the 15 unique bases (1.5). "
-        "Remove this marker once the -1 offset is applied to `end`."
-    ))
     def test_overlapping_pair_counts_each_base_once(self, overlap_pair):
         """The pair covers 15 distinct reference bases (1-based 1-15), so the total
         deduplicated coverage must equal 15 bases == 1.5 bins at 10bp."""
@@ -503,12 +487,12 @@ class TestPairDeduplication:
     ))
     def test_dovetail_left_tail_retained(self, dedup_bg):
         """The left mate reaches 1-based reference base 110; its coverage past the
-        right mate's end must be retained (max bedgraph end reaches 111)."""
+        right mate's end must be retained (max bedgraph end reaches 110)."""
         # Bound the upper end to the dovetail locus: the single-end read sits at
         # bedgraph start 114 and would otherwise be pulled into a bare start>=90
-        # slice, making its end (120) the max instead of the dovetail tail.
+        # slice, making its end (119) the max instead of the dovetail tail.
         dovetail = dedup_bg.filter((pl.col('start') >= 90) & (pl.col('start') < 114))
-        assert dovetail['end'].max() == 111
+        assert dovetail['end'].max() == 110
 
     @pytest.mark.xfail(strict=True, reason=(
         "A mateless read has null MPOS; `POS < null` is null, and the dedup filter "
