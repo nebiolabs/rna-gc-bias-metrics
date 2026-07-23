@@ -13,10 +13,12 @@ library preparation and sequencing chemistry.
 For each transcript the pipeline:
 
 1. Reads the BAM (via [polars-bio](https://github.com/biodatageeks/polars-bio))
-   and drops unmapped, secondary, and supplementary alignments.
+   and drops unmapped, secondary, and supplementary alignments, as well as paired
+   reads that are not properly paired (mate-unmapped or discordant mates). Single-end
+   reads and proper pairs are kept.
 2. Expands each read's CIGAR into the reference positions it covers, and
-   deduplicates the overlap between paired-end mates so shared bases are counted
-   once.
+   deduplicates the overlap between properly paired mates so shared bases are
+   counted once.
 3. Collapses coverage into a per-range bedgraph, then redistributes it into
    fixed-length bins (default 100 bp), splitting partial-bin coverage
    proportionally.
@@ -139,10 +141,10 @@ stages.
 
 ## Notes and limitations
 
-- Coverage is deduplicated across paired-end mates. Fully mateless reads
-  (single-end or mate-unmapped) and mate pairs that start at the same position
-  are not yet handled, and read-through ("dovetail") mate tails past the mate's
-  end are dropped.
+- Coverage is deduplicated across the overlap of properly paired mates so shared
+  bases are counted once. Paired reads that are not properly paired (mate-unmapped or discordant
+  mates) are dropped.
+  Read-through ("dovetail") mate tails past the mate's end are dropped.
 - The bedgraph `end` coordinate carries a known off-by-one that can leak a small
   amount of coverage into the adjacent bin.
 

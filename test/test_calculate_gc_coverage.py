@@ -137,11 +137,11 @@ class TestLoadSequences:
 # ---------------------------------------------------------------------------
 class TestLoadBam:
     def test_shape(self, bam_df):
-        assert bam_df.collect().shape == (4, 9)
+        assert bam_df.collect().shape == (4, 10)
 
     def test_columns(self, bam_df):
         assert set(bam_df.collect().columns) == set(
-            ['QNAME', 'FLAG', 'RNAME', 'POS', 'CIGAR', 'MPOS', 'ISIZE', 'FREVERSE', 'side']
+            ['QNAME', 'FLAG', 'RNAME', 'POS', 'CIGAR', 'MPOS', 'ISIZE', 'FPAIRED', 'FREVERSE', 'side']
         )
 
     def test_rnames(self, bam_df):
@@ -488,14 +488,26 @@ class TestPairDeduplication:
         dovetail = dedup_bg.filter((pl.col('start') >= 90) & (pl.col('start') < 114))
         assert dovetail['end'].max() == 110
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "A mateless read has null MPOS; `POS < null` is null, and the dedup filter "
-        "keeps only rows evaluating True, so the read is dropped. Single-end / "
-        "mate-unmapped reads are silently lost (the upstream flag filter does not "
-        "exclude them -- flag 8 is absent from exclude_flags=2308). Remove this "
-        "marker once mateless reads are retained."
-    ))
     def test_single_end_read_retained(self, dedup_expanded):
-        """A read with no mate (null MPOS) should still contribute its own coverage
-        rather than being dropped."""
-        assert dedup_expanded.filter(pl.col('QNAME') == 'singleend').height >= 1
+        """A single-end read (no mate, null MPOS) contributes its own coverage rather
+        than being dropped, and is never treated as a left mate to trim."""
+        singleend = dedup_expanded.filter(pl.col('QNAME') == 'singleend')
+        assert singleend.height == 1
+        row = singleend.row(0, named=True)
+        assert row['is_left_mate'] is False
+        assert row['cigar_end'] == row['cigar_end_dedup']  # untrimmed
+
+    def test_single_end_read_full_depth(self, dedup_bg):
+        """The single-end read (1-based 115-119) covers its full 5bp span at depth 1."""
+        singleend = dedup_bg.filter(pl.col('start') == 114).row(0, named=True)
+        assert singleend['end'] == 119
+        assert singleend['depth'] == 1
+
+    def test_nonproper_paired_mates_dropped(self, dedup_expanded):
+        """Paired reads that are not properly paired -- a mate-unmapped read and a
+        discordant (non-proper) mapped read -- are dropped in load_bam and never reach
+        the expanded coverage, since they have no reliable mate overlap to deduplicate."""
+        dropped = dedup_expanded.filter(
+            pl.col('QNAME').is_in(['nonproper_paired_munmap', 'nonproper_paired_discordant'])
+        )
+        assert dropped.height == 0

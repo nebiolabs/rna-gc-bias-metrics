@@ -84,16 +84,19 @@ def load_sequences(fp_fasta, fp_faidx):
 def load_bam(fp_bam, transcript_categories=None):
     '''Read a BAM into a lazy frame with SAM-style columns, flags, and R1/R2 side.
 
-    Scans `fp_bam` via polars-bio, drops unmapped/secondary/supplementary reads
-    (exclude_flags=2308), renames columns to the SAM spec, and adds a `FREVERSE`
-    boolean plus an R1/R2 `side` label. When `transcript_categories` is given,
-    `RNAME` is validated against it (raising if the BAM references sequences
-    absent from the FASTA index) and cast to a matching Enum.
+    Scans `fp_bam` via polars-bio and drops unmapped/secondary/supplementary
+    reads (exclude_flags=2308). Also drops paired reads that are not properly
+    paired (mate-unmapped or discordant mates), keeping single-end reads and
+    proper pairs -- see `expand_cigar` for how the retained classes are counted.
+    Renames columns to the SAM spec and adds `FPAIRED`/`FREVERSE` booleans plus
+    an R1/R2 `side` label. When `transcript_categories` is given, `RNAME` is
+    validated against it (raising if the BAM references sequences absent from the
+    FASTA index) and cast to a matching Enum.
 
     Example output:
-        QNAME         | FLAG | RNAME             | POS  | MPOS | CIGAR | ISIZE | FREVERSE | side
-        M05473…:12904 | 675  | ENST00000227525.8 | 1451 | 1475 | 75M   | 99    | false    | R2
-        M05473…:12904 | 595  | ENST00000227525.8 | 1475 | 1451 | 75M   | -99   | true     | R1
+        QNAME         | FLAG | RNAME             | POS  | MPOS | CIGAR | ISIZE | FPAIRED | FREVERSE | side
+        M05473…:12904 | 675  | ENST00000227525.8 | 1451 | 1475 | 75M   | 99    | true    | false    | R2
+        M05473…:12904 | 595  | ENST00000227525.8 | 1475 | 1451 | 75M   | -99   | true    | true     | R1
     '''
     # from dict(pysam.SAM_FLAGS.__members__), but not worth rest of pysam dependency
     sam_flags = {
@@ -121,12 +124,18 @@ def load_bam(fp_bam, transcript_categories=None):
         ]
 
     usecols = ['QNAME','FLAG','RNAME','POS','MPOS','CIGAR','ISIZE']
-    flags_to_use = ['FREAD1', 'FREAD2', 'FREVERSE']
+    flags_to_use = ['FPAIRED', 'FREAD1', 'FREAD2', 'FREVERSE']
     # polars-bio has no read-time flag exclusion, so replicate bam_utils'
     # exclude_flags=2308 (unmapped 4 + secondary 256 + supplementary 2048) as a filter.
     # use_zero_based=False keeps POS/MPOS 1-based to match the SAM spec (and bam_utils).
     bam_df = pb.scan_bam(str(fp_bam), use_zero_based=False)
     bam_df = bam_df.filter((pl.col('flags') & 2308) == 0)
+    # Keep single-end reads (FPAIRED unset, flag bit 1) and proper pairs
+    # (FPROPER_PAIR set, flag bit 2); drop paired reads that are not properly
+    # paired.
+    bam_df = bam_df.filter(
+        ((pl.col('flags') & 1) == 0) | ((pl.col('flags') & 2) != 0)
+    )
     bam_df = bam_df.rename({
         'name': 'QNAME', 'flags': 'FLAG', 'chrom': 'RNAME', 'start': 'POS',
         'cigar': 'CIGAR', 'mate_start': 'MPOS', 'template_length': 'ISIZE',
@@ -195,9 +204,9 @@ def expand_cigar(bam_df):
         M05473…:12904 | 675  | ENST00000227525.8 | 1451 | 1475
         M05473…:12904 | 595  | ENST00000227525.8 | 1475 | 1451
 
-        ISIZE | FREVERSE | side | cigar_length | cigar_pos_offset
-        99    | false    | R2   | 75           | 0
-        -99   | true     | R1   | 75           | 0
+        ISIZE | FPAIRED | FREVERSE | side | cigar_length | cigar_pos_offset
+        99    | true    | false    | R2   | 75           | 0
+        -99   | true    | true     | R1   | 75           | 0
 
         is_left_mate | cigar_start | cigar_end | cigar_end_dedup
         true         | 1451        | 1526      | 1475
@@ -230,11 +239,18 @@ def expand_cigar(bam_df):
     expanded_cigar_df = expanded_cigar_df.with_columns(
         # The left mate (smaller POS) cedes the overlap to the right mate. When
         # both mates start at the same position (POS == MPOS, fully overlapping),
-        # `<` alone leaves neither as the left mate and the shared span is counted
-        # twice, so break the tie on `side`: R1 becomes the left mate and is
-        # dropped, leaving R2 to cover the region once.
-        is_left_mate = (pl.col('POS') < pl.col('MPOS'))
-            | ((pl.col('POS') == pl.col('MPOS')) & (pl.col('side') == 'R1')),
+        # R1 becomes the left mate and is dropped, leaving R2 to cover the
+        # region once.
+        #
+        # Gate on `FPAIRED`: single-end reads have no mate (null MPOS) and must
+        # never be a left mate, otherwise `POS < null` yields null and the read
+        # is silently dropped by the overlap filter below. Only proper pairs
+        # survive load_bam's flag filter as paired reads, so `FPAIRED` here is
+        # exactly "has a concordant mate to deduplicate against".
+        is_left_mate = pl.col('FPAIRED') & (
+            (pl.col('POS') < pl.col('MPOS'))
+            | ((pl.col('POS') == pl.col('MPOS')) & (pl.col('side') == 'R1'))
+        ),
         cigar_start  = pl.col('POS') + pl.col('cigar_pos_offset'),
         cigar_end    = pl.col('POS') + pl.col('cigar_pos_offset') + pl.col('cigar_length')
     ).filter(   # First, remove leftmate cigar parts completely overlapping rightmate
