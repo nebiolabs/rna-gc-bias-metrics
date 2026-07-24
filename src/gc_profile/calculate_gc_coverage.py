@@ -625,9 +625,13 @@ def main():
         'depth_normalized': 'mean_normalized_depth',
         'count': 'transcriptome_bin_count',
         'gc_frac_rounded': 'gc_fraction'
-    }).select(
-        pl.col('gc_fraction','mean_normalized_depth','transcriptome_bin_count','transcriptome_bin_count_all_transcripts')
-    )
+    })
+
+    output_columns = ['gc_fraction', 'mean_normalized_depth', 'transcriptome_bin_count']
+    if args.report_bin_count_for_full_transcriptome:
+        output_columns.append('transcriptome_bin_count_all_transcripts')
+
+    output = output.select(pl.col(output_columns))
     output.write_csv(args.outfp, separator='\t')
 
 if __name__ == "__main__":
