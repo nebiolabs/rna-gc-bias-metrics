@@ -2,7 +2,7 @@
 
 Measure GC-content bias in RNA-seq coverage.
 
-Given a transcriptome FASTA and a BAM of reads aligned to it, `gc-profile`
+Given a transcriptome FASTA and a BAM of reads aligned to it, `rna-gc-bias-metrics`
 computes per-bin GC content and coverage depth, then summarizes how normalized
 coverage varies with GC fraction. This reveals whether a library is
 over- or under-covering GC-rich (or GC-poor) regions — a common artifact of
@@ -72,11 +72,11 @@ The tool runs as a module. Under uv, prefix commands with `uv run`; under pixi,
 use `pixi run`.
 
 ```bash
-uv run python -m gc_profile.calculate_gc_coverage \
+uv run python -m rna_gc_bias_metrics.calculate_gc_coverage \
     transcripts.fa \
     reads.bam \
     --report_bin_count_for_full_transcriptome \
-    -o gc_profile.tsv
+    -o gc_bias_profile.tsv
 ```
 
 ### Arguments
@@ -120,7 +120,7 @@ appear when the full-transcriptome background is reported.)
 The pipeline steps are importable for use in scripts or notebooks:
 
 ```python
-from gc_profile.calculate_gc_coverage import (
+from rna_gc_bias_metrics.calculate_gc_coverage import (
     load_sequences,
     calculate_gc_coverage,
     calculate_gc_pct_coverage,

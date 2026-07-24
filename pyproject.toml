@@ -3,7 +3,7 @@ requires = ["uv_build>=0.10.9,<0.11.0"]
 build-backend = "uv_build"
 
 [project]
-name = "gc-profile"
+name = "rna-gc-bias-metrics"
 version = "0.1.0"
 description = "A tool to calculate the GC bias profile of RNAseq data."
 authors = [{name = "Gautam Naishadham"}]

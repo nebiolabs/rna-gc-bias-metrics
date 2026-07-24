@@ -3,7 +3,7 @@ import pytest
 import polars as pl
 from polars.testing import assert_frame_equal
 
-from gc_profile.calculate_gc_coverage import (
+from rna_gc_bias_metrics.calculate_gc_coverage import (
     load_sequences,
     load_bam,
     expand_cigar,
