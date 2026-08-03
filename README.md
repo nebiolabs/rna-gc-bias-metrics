@@ -59,6 +59,17 @@ pixi install
 - A **BAM aligned to that transcriptome** (each `RNAME` is a transcript ID). BAM
   reference names must match the FASTA names, or the run aborts with an error.
 
+Every reference name — in the FASTA, the `.fa.fai` and the BAM — is taken as the
+header up to the **first whitespace**, so descriptive headers need no cleanup:
+
+```
+>ENST00000227525.8 cdna chromosome:GRCh38:12:6534517:6538371:1 gene:ENSG00000111640.15
+```
+
+is matched against a BAM `RNAME` of `ENST00000227525.8`. This mirrors the
+aligners (the SAM spec forbids whitespace in `RNAME`, so only the leading word
+survives alignment) and `samtools faidx`, which truncates the same way.
+
 To prepare a wrapped FASTA:
 
 ```bash

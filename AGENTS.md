@@ -32,6 +32,16 @@ rest of the pipeline (and the tests) working on SAM-style column names/dtypes:
 - There is **no downsampling** — `polars-bio` does not provide it and the
   feature was dropped along with the `--downsample` CLI flag.
 
+## Reference names (`_normalize_rname`)
+
+The FASTA, the `.fa.fai` and the BAM must agree on `rname`/`RNAME` for the joins
+and the shared Enum category set to line up, but they do not agree natively: a
+FASTA header keeps its full description, while aligners (the SAM spec forbids
+whitespace in `RNAME`) and `samtools faidx` both keep only the leading word.
+
+All three loaders therefore push their name through `_normalize_rname`, which
+truncates at the first whitespace.
+
 ## Daily workflow
 
 | Task | Command |

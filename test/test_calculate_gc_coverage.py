@@ -20,6 +20,11 @@ BAM = os.path.join(FIXTURES, 'bam', 'test.bam')
 FASTA = os.path.join(FIXTURES, 'fasta', 'test_gencode_v33.fa')
 FAIDX = os.path.join(FIXTURES, 'fasta', 'test_gencode_v33.fa.fai')
 
+# Same four transcripts and byte-identical sequences as FASTA, but with Ensembl
+# style descriptions on the headers -- for TestReferenceNameNormalization.
+DESC_FASTA = os.path.join(FIXTURES, 'fasta', 'test_gencode_v33_with_descriptions.fa')
+DESC_FAIDX = os.path.join(FIXTURES, 'fasta', 'test_gencode_v33_with_descriptions.fa.fai')
+
 TRANSCRIPTS = ['ENST00000227525.8', 'ENST00000536171.1', 'ENST00000540280.1', 'ENST00000438571.5']
 TRANSCRIPT_LENGTHS = {'ENST00000227525.8': 2129, 'ENST00000536171.1': 1959, 'ENST00000540280.1': 724, 'ENST00000438571.5': 792}
 BIN_BP = 100
@@ -511,3 +516,57 @@ class TestPairDeduplication:
             pl.col('QNAME').is_in(['nonproper_paired_munmap', 'nonproper_paired_discordant'])
         )
         assert dropped.height == 0
+
+
+# ---------------------------------------------------------------------------
+# 13. Reference name normalization
+# ---------------------------------------------------------------------------
+class TestReferenceNameNormalization:
+    """A reference name is the FASTA header up to the first whitespace.
+
+    Aligners cannot store more than that (the SAM spec forbids whitespace in
+    RNAME) and `samtools faidx` truncates identically, so a FASTA carrying
+    descriptive headers must resolve to the same names as the BAM and .fai it
+    is paired with. Without the truncation the descriptive header is not a
+    member of the faidx-derived Enum and loading fails outright.
+
+    DESC_FASTA holds the same four transcripts and byte-identical sequences as
+    FASTA, so every result below must equal its plain-header counterpart.
+    """
+
+    @pytest.fixture(scope="class")
+    def desc_sequences_and_faidx(self):
+        return load_sequences(DESC_FASTA, DESC_FAIDX)
+
+    def test_fasta_names_drop_description(self, desc_sequences_and_faidx):
+        """The description after the first whitespace is not part of the name."""
+        sequences = desc_sequences_and_faidx[0].collect()
+        assert sequences['rname'].cast(pl.String).to_list() == TRANSCRIPTS
+
+    def test_tab_terminates_name(self, desc_sequences_and_faidx):
+        """Any whitespace ends the name, not just a space -- ENST00000540280.1's
+        header is tab-separated from its description."""
+        sequences = desc_sequences_and_faidx[0].collect()
+        assert 'ENST00000540280.1' in sequences['rname'].cast(pl.String).to_list()
+
+    def test_sequences_unaffected_by_truncation(self, desc_sequences_and_faidx):
+        """Only the header is trimmed; sequence content is untouched."""
+        sequences = desc_sequences_and_faidx[0].collect()
+        for row in sequences.iter_rows(named=True):
+            assert len(row['seq']) == TRANSCRIPT_LENGTHS[row['rname']]
+
+    def test_faidx_matches_plain_header_fixture(self, desc_sequences_and_faidx, faidx):
+        assert_frame_equal(desc_sequences_and_faidx[1].collect(), faidx.collect())
+
+    def test_fasta_matches_plain_header_fixture(self, desc_sequences_and_faidx, sequences):
+        assert_frame_equal(desc_sequences_and_faidx[0].collect(), sequences.collect())
+
+    def test_end_to_end_matches_plain_header_fixture(self, desc_sequences_and_faidx, bin_cov_with_gc):
+        desc_sequences, desc_faidx = desc_sequences_and_faidx
+        result = calculate_gc_coverage(
+            BAM, desc_sequences, desc_faidx, fixed_length_bin_bp=BIN_BP
+        ).collect()
+        assert_frame_equal(
+            result.sort('rname', 'bin_start'),
+            bin_cov_with_gc.collect().sort('rname', 'bin_start')
+        )
