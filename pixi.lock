@@ -1485,7 +1485,7 @@ packages:
   size: 3127137
   timestamp: 1769460817696
 - pypi: .
-  name: gc-profile
+  name: rna-gc-bias-metrics
   requires_dist:
   - numpy>=2.3.2
   - polars>=1.37.1

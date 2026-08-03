@@ -1,5 +1,5 @@
 [workspace]
-name = "gc-profile"
+name = "rna-gc-bias-metrics"
 channels = ["conda-forge", "bioconda"]
 platforms = ["osx-arm64", "osx-64", "linux-64"]
 preview = ["pixi-build"]
@@ -10,10 +10,10 @@ python = ">=3.12"
 numpy = ">=2.3.2"
 polars = ">=1.37.1"
 
-# gc-profile installs editable via uv. polars-bio is PyPI-only, so it lives here
-# rather than in [dependencies].
+# rna-gc-bias-metrics installs editable via uv. polars-bio is PyPI-only, so it
+# lives here rather than in [dependencies].
 [pypi-dependencies]
-gc-profile = { path = ".", editable = true }
+rna-gc-bias-metrics = { path = ".", editable = true }
 polars-bio = ">=0.31"
 
 [feature.dev.dependencies]

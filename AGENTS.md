@@ -1,16 +1,17 @@
-# Agent Notes for gc_profile
+# Agent Notes for rna_gc_bias_metrics
 
 ## Project layout
 
-`gc_profile` is a pure-Python package built with the `uv_build` PEP 517
+`rna_gc_bias_metrics` is a pure-Python package built with the `uv_build` PEP 517
 backend. BAM files are loaded into Polars via `polars-bio` (`pb.scan_bam`).
 
 - `pyproject.toml` — package definition. Plain PyPI dependencies only
   (`polars`, `polars-bio`, `numpy`); no `[tool.uv.sources]`.
-- `src/gc_profile/` — Python source. Use `from gc_profile.calculate_gc_coverage import ...`,
-  not the old flat-layout `from calculate_gc_coverage import ...`. The src
-  layout was introduced in commit `f87d09c`; tests and any new callers must
-  use the package-qualified import.
+- `src/rna_gc_bias_metrics/` — Python source. Use
+  `from rna_gc_bias_metrics.calculate_gc_coverage import ...`, not the old
+  flat-layout `from calculate_gc_coverage import ...`. The src layout was
+  introduced in commit `f87d09c`; tests and any new callers must use the
+  package-qualified import.
 - `test/test_calculate_gc_coverage.py` — pytest suite.
 - `pyproject.toml` + `uv.lock` — uv workflow.
 - `pixi.toml` + `pixi.lock` — pixi workflow.
@@ -30,6 +31,16 @@ rest of the pipeline (and the tests) working on SAM-style column names/dtypes:
   expected dtypes (`FLAG→UInt16`, `RNAME→Categorical`; the rest already match).
 - There is **no downsampling** — `polars-bio` does not provide it and the
   feature was dropped along with the `--downsample` CLI flag.
+
+## Reference names (`_normalize_rname`)
+
+The FASTA, the `.fa.fai` and the BAM must agree on `rname`/`RNAME` for the joins
+and the shared Enum category set to line up, but they do not agree natively: a
+FASTA header keeps its full description, while aligners (the SAM spec forbids
+whitespace in `RNAME`) and `samtools faidx` both keep only the leading word.
+
+All three loaders therefore push their name through `_normalize_rname`, which
+truncates at the first whitespace.
 
 ## Daily workflow
 

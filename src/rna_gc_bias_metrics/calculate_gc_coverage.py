@@ -10,11 +10,26 @@ import polars as pl
 import polars_bio as pb
 
 
+def _normalize_rname(rname):
+    '''Truncate a reference name expression at the first whitespace.
+
+    The three inputs disagree on how much of a FASTA header is the sequence
+    name. The SAM spec forbids whitespace in RNAME, so aligners emit only the
+    leading word, and `samtools faidx` records that same word in the .fai NAME
+    column; a FASTA header meanwhile keeps its full description (e.g.
+    `>ENST00000227525.8 cdna chromosome:GRCh38:...`). Truncating every source
+    to the leading word gives the joins a single shared name space.
+    '''
+    return rname.str.extract(r'^(\S+)')
+
+
 def _load_faidx(fp_faidx):
     '''Read a .fa.fai index into a lazy frame of transcript names and lengths.
 
-    `rname` is cast to an Enum over the file's own name order so downstream
-    joins and category alignment stay consistent.
+    `rname` is truncated at the first whitespace (see `_normalize_rname`) and
+    cast to an Enum over the file's own name order, so downstream joins and
+    category alignment stay consistent. The Enum built here is the canonical
+    category set that the FASTA and BAM are aligned to.
 
     Example output:
         rname             | length
@@ -26,9 +41,10 @@ def _load_faidx(fp_faidx):
         separator = '\t',
         has_header = False,
         new_columns = ['rname','length'],
-        schema_overrides = {'length':pl.UInt32}
+        schema_overrides = {'rname':pl.String, 'length':pl.UInt32}
     ).select(
-        pl.col('rname','length')
+        _normalize_rname(pl.col('rname')),
+        pl.col('length')
     )
     
     faidx = faidx.with_columns(
@@ -41,18 +57,15 @@ def _load_faidx(fp_faidx):
 def _load_fasta(fp_fasta, transcript_categories=None):
     '''Read an unwrapped (single-line-sequence) FASTA into a lazy frame.
 
-    When `transcript_categories` is given, `rname` is cast to a matching Enum.
+    `rname` is the header truncated at the first whitespace. When
+    `transcript_categories` is given, `rname` is then cast to a matching Enum.
 
-    Example output:
+    Example output, for a header of
+    `>ENST00000227525.8 cdna chromosome:GRCh38:12:6534517:6538371:1`:
         rname             | seq
         ENST00000227525.8 | ATCCCGCCTTGCGCATGCGG…
         ENST00000536171.1 | CCTGGCAGACCCAGTCATGG…
     '''
-    if transcript_categories is not None:
-        schema_overrides = {'rname': pl.Enum(transcript_categories)}
-    else:
-        schema_overrides = None
-    
     # Assumes single-line (unwrapped) sequences: each record parses to
     # [rname, seq, ''] where the trailing field is the newline before the next
     # '>'. truncate_ragged_lines drops that trailing field (polars >=1.34 errors
@@ -63,12 +76,18 @@ def _load_fasta(fp_fasta, transcript_categories=None):
         eol_char='>',
         new_columns = ['rname','seq'],
         has_header=False,
-        schema_overrides = schema_overrides,
+        schema_overrides = {'rname': pl.String},
         infer_schema_length=1000000,
         truncate_ragged_lines=True
     ).select(
-        pl.col('rname','seq')
+        _normalize_rname(pl.col('rname')),
+        pl.col('seq')
     ).drop_nulls()
+
+    if transcript_categories is not None:
+        sequences = sequences.with_columns(
+            pl.col('rname').cast(pl.Enum(transcript_categories))
+        )
 
     return sequences
 
@@ -89,7 +108,8 @@ def load_bam(fp_bam, transcript_categories=None):
     paired (mate-unmapped or discordant mates), keeping single-end reads and
     proper pairs -- see `expand_cigar` for how the retained classes are counted.
     Renames columns to the SAM spec and adds `FPAIRED`/`FREVERSE` booleans plus
-    an R1/R2 `side` label. When `transcript_categories` is given, `RNAME` is
+    an R1/R2 `side` label. `RNAME` is truncated at the first whitespace (see
+    `_normalize_rname`). When `transcript_categories` is given, `RNAME` is
     validated against it (raising if the BAM references sequences absent from the
     FASTA index) and cast to a matching Enum.
 
@@ -141,6 +161,8 @@ def load_bam(fp_bam, transcript_categories=None):
         'cigar': 'CIGAR', 'mate_start': 'MPOS', 'template_length': 'ISIZE',
     }).select(
         *usecols
+    ).with_columns(
+        _normalize_rname(pl.col('RNAME'))
     ).cast({
         'FLAG': pl.UInt16,        # polars-bio emits UInt32
         'RNAME': pl.Categorical,  # polars-bio emits String
