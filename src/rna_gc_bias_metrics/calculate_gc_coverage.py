@@ -1,12 +1,9 @@
 
-import sys
-from pathlib import Path
-from os.path import join, splitext
 import argparse
+from pathlib import Path
+
 import numpy as np
-
 import polars as pl
-
 import polars_bio as pb
 
 
@@ -46,7 +43,7 @@ def _load_faidx(fp_faidx):
         _normalize_rname(pl.col('rname')),
         pl.col('length')
     )
-    
+
     faidx = faidx.with_columns(
         pl.col('rname').cast(pl.Enum(categories=faidx.select('rname')))
     ).lazy()
@@ -633,7 +630,7 @@ def main():
         on='gc_frac_rounded',
         how='left'
     )
-    
+
     if args.report_bin_count_for_full_transcriptome:
         output = output.join(
             gc_pct_frequency_all_transcripts,
@@ -642,7 +639,7 @@ def main():
         ).rename({
             'count_bins_full_transcriptome': 'transcriptome_bin_count_all_transcripts'
         })
-    
+
     output = output.rename({
         'depth_normalized': 'mean_normalized_depth',
         'count': 'transcriptome_bin_count',
