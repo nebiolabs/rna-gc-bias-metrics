@@ -237,7 +237,8 @@ def expand_cigar(bam_df):
             r'\d+[MX=DN]'    # all ops that "consume reference" in SAM spec
         ).alias('cigar_part')
     ).explode(
-        'cigar_part'
+        'cigar_part',
+        empty_as_null=True
     ).with_columns(
         pl.col('cigar_part').str.extract_groups(
             r'(\d+)([MX=DN])'
@@ -383,7 +384,7 @@ def get_binned_coverage(bg, fixed_length_bin_bp, faidx):
             'region_id','rname','depth','start_bin','end_bin','start_bin_frc','end_bin_frc'
         ).repeat_by(
             pl.col('center_bin_ct') + 1 + pl.when(pl.col('end_bin_frc') != 0).then(1).otherwise(0)
-        ).explode()
+        ).explode(empty_as_null=True)
     ).with_columns(
         bin_id = pl.int_range(pl.len()).over('region_id') + pl.col('start_bin')
     ).with_columns(
@@ -441,7 +442,8 @@ def get_bin_gc(bin_cov, fixed_length_bin_bp, sequences):
         pl.exclude('length'),
         pl.int_ranges(pl.col('length'), step=fixed_length_bin_bp).alias('bin_start')
     ).explode(
-        'bin_start'
+        'bin_start',
+        empty_as_null=True
     ).cast(
         {'seq':pl.String}
     ).select(
@@ -547,7 +549,8 @@ def calculate_gc_pct_frequency_across_full_transcriptome(sequences, fixed_length
     return sequences.with_columns(
         pl.int_ranges(pl.col('seq').str.len_chars(), step=fixed_length_bin_bp).alias('start')
     ).explode(
-        'start'
+        'start',
+        empty_as_null=True
     ).select(
         pl.col('seq').str.slice(pl.col('start'), fixed_length_bin_bp).alias('bin_seq')
     ).select(
