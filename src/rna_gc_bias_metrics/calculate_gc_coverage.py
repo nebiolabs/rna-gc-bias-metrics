@@ -45,7 +45,7 @@ def _load_faidx(fp_faidx):
     )
 
     faidx = faidx.with_columns(
-        pl.col('rname').cast(pl.Enum(categories=faidx.select('rname')))
+        pl.col('rname').cast(pl.Enum(categories=faidx['rname']))
     ).lazy()
 
     return faidx
@@ -92,7 +92,7 @@ def _load_fasta(fp_fasta, transcript_categories=None):
 def load_sequences(fp_fasta, fp_faidx):
     '''Load the faidx and FASTA, aligning `rname` categories, and return both.'''
     faidx = _load_faidx(fp_faidx)
-    transcript_categories = faidx.select(pl.col('rname').cat.get_categories()).collect()
+    transcript_categories = faidx.collect_schema()['rname'].categories
     sequences = _load_fasta(fp_fasta, transcript_categories=transcript_categories)
     return sequences, faidx
 
@@ -180,14 +180,13 @@ def load_bam(fp_bam, transcript_categories=None):
 
     if transcript_categories is not None:
         # Check that all transcripts in bam are present in faidx
-        categories = transcript_categories.to_series()
         bam_rnames = (
             bam_df.select(pl.col('RNAME').cast(pl.String))
             .unique()
             .collect()
             .to_series()
         )
-        missing = bam_rnames.filter(~bam_rnames.is_in(categories.implode())).sort()
+        missing = bam_rnames.filter(~bam_rnames.is_in(transcript_categories.implode())).sort()
         if missing.len() > 0:
             preview = ', '.join(missing.head(10).to_list())
             raise ValueError(
@@ -498,7 +497,7 @@ def plot(bin_cov_with_gc):
 
 def calculate_gc_coverage(fp_bam, sequences, faidx, fixed_length_bin_bp=100):
     '''Run the full BAM→binned GC-vs-coverage pipeline for one BAM.'''
-    transcript_categories = faidx.select(pl.col('rname').cat.get_categories()).collect()
+    transcript_categories = faidx.collect_schema()['rname'].categories
     bam_df = load_bam(fp_bam, transcript_categories=transcript_categories)
     expanded_cigar_df = expand_cigar(bam_df)
     bg = bam_to_bedgraph(expanded_cigar_df)

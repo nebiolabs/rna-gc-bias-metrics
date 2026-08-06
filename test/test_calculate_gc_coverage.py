@@ -72,7 +72,7 @@ def faidx(sequences_and_faidx):
 
 @pytest.fixture(scope="module")
 def transcript_categories(faidx):
-    return faidx.select(pl.col('rname').cat.get_categories()).collect()
+    return faidx.collect_schema()['rname'].categories
 
 
 @pytest.fixture(scope="module")
@@ -356,7 +356,7 @@ class TestExactBinCoordinates:
     def pipeline(self, seqs_faidx):
         """Returns (bedgraph LazyFrame, collected+sorted get_bin_gc result)."""
         sequences, faidx = seqs_faidx
-        transcript_categories = faidx.select(pl.col('rname').cat.get_categories()).collect()
+        transcript_categories = faidx.collect_schema()['rname'].categories
         bam = load_bam(END_COORD_BAM, transcript_categories=transcript_categories)
         bg = bam_to_bedgraph(expand_cigar(bam))
         bin_cov = get_binned_coverage(bg, EXACT_COORD_BIN_BP, faidx)
@@ -389,7 +389,7 @@ class TestExactBinCoordinates:
     def start_coord_bin_cov_with_gc(self, seqs_faidx):
         """get_bin_gc result for a single 10bp read starting at the first G (bin 1)."""
         sequences, faidx = seqs_faidx
-        transcript_categories = faidx.select(pl.col('rname').cat.get_categories()).collect()
+        transcript_categories = faidx.collect_schema()['rname'].categories
         bam = load_bam(START_COORD_BAM, transcript_categories=transcript_categories)
         bin_cov = get_binned_coverage(bam_to_bedgraph(expand_cigar(bam)), EXACT_COORD_BIN_BP, faidx)
         return get_bin_gc(bin_cov, EXACT_COORD_BIN_BP, sequences).collect().sort('bin_start')
@@ -406,7 +406,7 @@ class TestExactBinCoordinates:
     def overlap_pair(self, seqs_faidx):
         """(expand_cigar, get_bin_gc) for an overlapping pair on chrDemo."""
         sequences, faidx = seqs_faidx
-        transcript_categories = faidx.select(pl.col('rname').cat.get_categories()).collect()
+        transcript_categories = faidx.collect_schema()['rname'].categories
         bam = load_bam(PAIR_OVERLAP_BAM, transcript_categories=transcript_categories)
         expanded = expand_cigar(bam).collect()
         bin_cov = get_binned_coverage(bam_to_bedgraph(expand_cigar(bam)), EXACT_COORD_BIN_BP, faidx)
@@ -445,14 +445,14 @@ class TestPairDeduplication:
     @pytest.fixture(scope="class")
     def dedup_expanded(self, seqs_faidx):
         _, faidx = seqs_faidx
-        transcript_categories = faidx.select(pl.col('rname').cat.get_categories()).collect()
+        transcript_categories = faidx.collect_schema()['rname'].categories
         bam = load_bam(PAIR_DEDUP_BAM, transcript_categories=transcript_categories)
         return expand_cigar(bam).collect()
 
     @pytest.fixture(scope="class")
     def dedup_bg(self, seqs_faidx):
         _, faidx = seqs_faidx
-        transcript_categories = faidx.select(pl.col('rname').cat.get_categories()).collect()
+        transcript_categories = faidx.collect_schema()['rname'].categories
         bam = load_bam(PAIR_DEDUP_BAM, transcript_categories=transcript_categories)
         return bam_to_bedgraph(expand_cigar(bam)).collect()
 
