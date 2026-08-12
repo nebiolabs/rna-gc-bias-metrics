@@ -166,6 +166,11 @@ class TestLoadBam:
         counts = bam_df.collect()['FREVERSE'].value_counts().sort('FREVERSE')
         assert counts['count'].to_list() == [2, 2]
 
+    def test_faidx_transcripts_absent_from_bam_do_not_raise(self, bam_df, transcript_categories):
+        """The check asserts BAM ⊆ faidx only -- do not make it symmetric."""
+        bam_names = set(bam_df.collect()['RNAME'].cast(pl.String))
+        assert bam_names < set(transcript_categories)
+
 
 # ---------------------------------------------------------------------------
 # 4. expand_cigar
@@ -243,6 +248,11 @@ class TestGetBinnedCoverage:
         expected = [0.5, 0.49, 0.65, 0.1, 0.68, 0.07]
         for actual, exp in zip(df['depth_fractional'].to_list(), expected):
             assert abs(actual - exp) < 1e-10
+
+    def test_mismatched_rname_dtype_raises(self, faidx):
+        bg_categorical = bam_to_bedgraph(expand_cigar(load_bam(BAM)))
+        with pytest.raises(ValueError, match='dtype mismatch'):
+            get_binned_coverage(bg_categorical, BIN_BP, faidx)
 
 
 # ---------------------------------------------------------------------------

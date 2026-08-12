@@ -198,7 +198,6 @@ def load_bam(fp_bam, transcript_categories=None):
         bam_df = bam_df.with_columns(
             pl.col('RNAME').cast(pl.Enum(categories=transcript_categories))
         )
-    #TO DO: will we ever use this without transcript_categories?
 
     # if bam_df.select('QNAME','side').collect().is_duplicated().sum() > 0:
     #     raise ValueError('Expects one alignment per side per pair')
@@ -331,6 +330,16 @@ def get_binned_coverage(bg, fixed_length_bin_bp, faidx):
         ENST00000227525.8 | 1400.0    | 0.5
         ENST00000227525.8 | 1500.0    | 0.49
     '''
+    bg_dtype = bg.collect_schema()['rname']
+    faidx_dtype = faidx.collect_schema()['rname']
+    if bg_dtype != faidx_dtype:
+        raise ValueError(
+            f"`rname` dtype mismatch: bedgraph has {bg_dtype}, faidx has {faidx_dtype}. "
+            "The transcript categories must come from the same FASTA index; pass "
+            "faidx.collect_schema()['rname'].categories to load_bam (or use "
+            "calculate_gc_coverage, which wires this up)."
+        )
+
     binning_type = 'fixed_length'   # One of ['fixed_length', 'fixed_n_bins']
 
     if binning_type == 'fixed_length':
