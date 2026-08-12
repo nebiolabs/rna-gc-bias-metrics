@@ -347,14 +347,6 @@ def get_binned_coverage(bg, fixed_length_bin_bp, faidx):
         on='rname',
         how='inner'
     )
-    # TO DO CHECK THIS!! Looking at the end_bin code, we may actually want this to remain exclusive
-    # convert "end" field from exclusive to inclusive
-    # bin_cov = bin_cov.with_columns(
-    #     end = pl.col('end') - 1,
-    #     LENGTH = pl.col('LENGTH') - 1
-    #     )
-
-    # Calculate bin membership and fractions for each region
     bin_cov = bin_cov.with_columns(
         start_bin = pl.col('start_bin_exact').floor(),
         end_bin = pl.col('end_bin_exact').floor()

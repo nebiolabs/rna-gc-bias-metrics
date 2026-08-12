@@ -156,8 +156,6 @@ stages.
   bases are counted once. Paired reads that are not properly paired (mate-unmapped or discordant
   mates) are dropped.
   Read-through ("dovetail") mate tails past the mate's end are dropped.
-- The bedgraph `end` coordinate carries a known off-by-one that can leak a small
-  amount of coverage into the adjacent bin.
 
 ## Development
 
