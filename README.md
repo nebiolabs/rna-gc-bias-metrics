@@ -110,16 +110,27 @@ A tab-separated table, one row per rounded GC fraction:
 | `transcriptome_bin_count` | Number of covered bins at this GC fraction. |
 | `transcriptome_bin_count_all_transcripts` | Bins at this GC fraction across all transcripts (only with `--report_bin_count_for_full_transcriptome`). |
 
-Example (run against the bundled test fixtures):
+Example (run against the bundled test fixtures, abridged from 30 rows):
 
 ```
 gc_fraction  mean_normalized_depth  transcriptome_bin_count  transcriptome_bin_count_all_transcripts
-0.47         0.9900990099009903     1                        1
-0.59         1.0099009900990097     1                        3
-0.65         1.7894736842105265     1                        3
-0.68         0.28947368421052655    1                        1
-0.70         0.21052631578947384    1                        1
-0.77         1.7105263157894732     1                        1
+0.24                                                         1
+0.25                                                         1
+0.28                                                         1
+…
+0.47         0.9898989898989902     1                        1
+0.48                                                         2
+0.49                                                         2
+…
+0.59         1.01010101010101       1                        3
+…
+0.65         1.8133333333333332     1                        3
+0.66                                                         2
+0.67                                                         3
+0.68         0.26666666666666683    1                        1
+0.7          0.18666666666666737    1                        1
+0.71                                                         2
+0.77         1.7333333333333325     1                        1
 ```
 
 (GC fractions with no covered bins have empty depth/count columns but still
