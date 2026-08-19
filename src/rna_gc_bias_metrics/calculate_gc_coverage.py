@@ -52,7 +52,7 @@ def _load_faidx(fp_faidx):
 
 
 def _load_fasta(fp_fasta, transcript_categories=None):
-    '''Read an unwrapped (single-line-sequence) FASTA into a lazy frame.
+    '''Read a FASTA (wrapped or unwrapped) into a lazy frame.
 
     `rname` is the header truncated at the first whitespace. When
     `transcript_categories` is given, `rname` is then cast to a matching Enum.
@@ -63,22 +63,25 @@ def _load_fasta(fp_fasta, transcript_categories=None):
         ENST00000227525.8 | ATCCCGCCTTGCGCATGCGG…
         ENST00000536171.1 | CCTGGCAGACCCAGTCATGG…
     '''
-    # Assumes single-line (unwrapped) sequences: each record parses to
-    # [rname, seq, ''] where the trailing field is the newline before the next
-    # '>'. truncate_ragged_lines drops that trailing field (polars >=1.34 errors
-    # on it otherwise instead of silently dropping it).
+    # '>' as the line terminator gives one record per row, and a separator byte
+    # that cannot occur in a FASTA keeps that whole record -- header line plus
+    # every sequence line -- in a single field.
     sequences = pl.scan_csv(
         fp_fasta,
-        separator='\n',
+        separator='\x01',
         eol_char='>',
-        new_columns = ['rname','seq'],
+        new_columns = ['record'],
         has_header=False,
-        schema_overrides = {'rname': pl.String},
+        schema_overrides = {'record': pl.String},
+        quote_char=None,
         infer_schema_length=1000000,
         truncate_ragged_lines=True
     ).select(
-        _normalize_rname(pl.col('rname')),
-        pl.col('seq')
+        _normalize_rname(pl.col('record')).alias('rname'),
+        pl.col('record')
+          .str.replace(r'^[^\n]*\n', '')
+          .str.replace_all(r'[\r\n]', '')    # [\r\n], not \n, to accept CRLF
+          .alias('seq')
     ).drop_nulls()
 
     if transcript_categories is not None:
