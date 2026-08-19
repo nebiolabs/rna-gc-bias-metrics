@@ -65,3 +65,28 @@ When a runtime dependency is added or removed, mirror it manually in:
    `[pypi-dependencies]` for PyPI-only ones (e.g. `polars-bio`).
 
 There is no automated check yet.
+
+## To do
+
+- **Raise the memory ceiling for production runs.** `_load_fasta` used to keep only
+  the first sequence line of each record, so a line-wrapped reference parsed to a
+  fraction of its sequence. Parsing whole records takes peak RSS on the T2T
+  transcriptome from ~2.4 GB to ~10.4 GB, so Nextflow `memory` directives sized
+  against the old figure need raising before the next production rerun.
+
+  The growth is mostly amplification, not the extra sequence itself. `get_bin_gc`
+  explodes to one row per bin while carrying the full `seq` string, slicing
+  `bin_seq` out only afterwards, so every transcript's whole sequence is
+  duplicated once per bin. The factor is length-weighted --
+  `mean_length * (1 + CV**2) / fixed_length_bin_bp`, ~37x on a transcriptome-like
+  length distribution -- and truncated sequences yielded a single bin per
+  transcript, hence a factor of 1. Measured at a tenth of T2T scale: 39 MB of
+  sequence becomes 1.46 GB after the explode, against ~40 MB for the `bin_seq`
+  slices themselves.
+
+  Chunking each sequence into bin-sized pieces before the explode
+  (`pl.col('seq').str.extract_all('.{1,N}')` -> `List[String]`) makes every base
+  appear exactly once, so the explode duplicates nothing: 1.92 GB -> 0.50 GB peak
+  at that scale, with identical `gc_frac`. `main()`'s `pl.collect_all` also holds
+  this stage and `calculate_gc_pct_frequency_across_full_transcriptome` in memory
+  concurrently. Keep any of this as its own change.
