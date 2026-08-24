@@ -128,7 +128,7 @@ gc_fraction  mean_normalized_depth  transcriptome_bin_count  transcriptome_bin_c
 0.47         10.888888888888891     1                        1
 0.48         0.0                    1                        2
 0.49                                                         2
-0.50         0.0                    1                        1
+0.5          0.0                    1                        1
 0.51         0.0                    1                        1
 0.52                                                         1
 0.53         0.0                    3                        5
@@ -137,7 +137,7 @@ gc_fraction  mean_normalized_depth  transcriptome_bin_count  transcriptome_bin_c
 0.57                                                         1
 0.58         0.0                    1                        5
 0.59         5.5555555555555545     2                        3
-0.60         0.0                    1                        2
+0.6          0.0                    1                        2
 0.61         0.0                    1                        3
 0.62         0.0                    2                        3
 0.64                                                         2
@@ -145,7 +145,7 @@ gc_fraction  mean_normalized_depth  transcriptome_bin_count  transcriptome_bin_c
 0.66                                                         2
 0.67         0.0                    2                        3
 0.68         0.5333333333333337     1                        1
-0.70         0.37333333333333474    1                        1
+0.7          0.37333333333333474    1                        1
 0.71         0.0                    1                        2
 0.77         3.466666666666665      1                        1
 ```
