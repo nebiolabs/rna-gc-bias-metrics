@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "rna-gc-bias-metrics"
-version = "0.1.2"
+version = "0.2.0"
 description = "A tool to calculate the GC bias profile of RNAseq data."
 authors = [{name = "Gautam Naishadham"}]
 readme = "README.md"

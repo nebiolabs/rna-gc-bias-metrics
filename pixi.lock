@@ -1534,8 +1534,8 @@ packages:
   timestamp: 1787033878899
 - pypi: ./
   name: rna-gc-bias-metrics
-  version: 0.1.2
-  sha256: 01f8b58adbd53338b9910bcfe7de9b4c6e69b952152320232df7eab8024f4584
+  version: 0.2.0
+  sha256: 34321c54e70deb00cee92da0a1d555de26e0c66e139603a1d984d619a4a4dc8f
   requires_dist:
   - numpy>=2.3.2
   - polars>=1.37.1
