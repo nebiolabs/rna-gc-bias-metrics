@@ -52,8 +52,8 @@ pixi install
 
 ## Input requirements
 
-- **Transcriptome FASTA** with **single-line (unwrapped)** sequences — one line
-  of sequence per record. Wrapped FASTA is not parsed correctly.
+- **Transcriptome FASTA**, either line-wrapped (as `samtools faidx`, GENCODE and
+  Ensembl emit by default) or with single-line sequences. Both parse identically.
 - A FASTA index named `<name>.fa.fai` alongside it (created with
   `samtools faidx`).
 - A **BAM aligned to that transcriptome** (each `RNAME` is a transcript ID). BAM
@@ -70,11 +70,10 @@ is matched against a BAM `RNAME` of `ENST00000227525.8`. This mirrors the
 aligners (the SAM spec forbids whitespace in `RNAME`, so only the leading word
 survives alignment) and `samtools faidx`, which truncates the same way.
 
-To prepare a wrapped FASTA:
+To index a FASTA:
 
 ```bash
-seqkit seq -w 0 transcripts.fa > transcripts.unwrapped.fa   # unwrap sequences
-samtools faidx transcripts.unwrapped.fa                      # create .fa.fai
+samtools faidx transcripts.fa    # creates transcripts.fa.fai
 ```
 
 ## Usage

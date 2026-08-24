@@ -25,6 +25,11 @@ FAIDX = os.path.join(FIXTURES, 'fasta', 'test_gencode_v33.fa.fai')
 DESC_FASTA = os.path.join(FIXTURES, 'fasta', 'test_gencode_v33_with_descriptions.fa')
 DESC_FAIDX = os.path.join(FIXTURES, 'fasta', 'test_gencode_v33_with_descriptions.fa.fai')
 
+# Same four transcripts and byte-identical sequences as FASTA, but wrapped at 60
+# columns -- for TestWrappedFasta.
+WRAPPED_FASTA = os.path.join(FIXTURES, 'fasta', 'test_gencode_v33_wrapped.fa')
+WRAPPED_FAIDX = os.path.join(FIXTURES, 'fasta', 'test_gencode_v33_wrapped.fa.fai')
+
 TRANSCRIPTS = ['ENST00000227525.8', 'ENST00000536171.1', 'ENST00000540280.1', 'ENST00000438571.5']
 TRANSCRIPT_LENGTHS = {'ENST00000227525.8': 2129, 'ENST00000536171.1': 1959, 'ENST00000540280.1': 724, 'ENST00000438571.5': 792}
 BIN_BP = 100
@@ -662,6 +667,41 @@ class TestReferenceNameNormalization:
         desc_sequences, desc_faidx = desc_sequences_and_faidx
         result = calculate_gc_coverage(
             BAM, desc_sequences, desc_faidx, fixed_length_bin_bp=BIN_BP
+        ).collect()
+        assert_frame_equal(
+            result.sort('rname', 'bin_start'),
+            bin_cov_with_gc.collect().sort('rname', 'bin_start')
+        )
+
+
+# ---------------------------------------------------------------------------
+# 14. Line-wrapped FASTA
+# ---------------------------------------------------------------------------
+class TestWrappedFasta:
+    """WRAPPED_FASTA holds the same four transcripts and byte-identical sequences
+    as FASTA, so every result below must equal its unwrapped counterpart.
+    """
+
+    @pytest.fixture(scope="class")
+    def wrapped_sequences_and_faidx(self):
+        return load_sequences(WRAPPED_FASTA, WRAPPED_FAIDX)
+
+    def test_sequence_lengths_match_faidx(self, wrapped_sequences_and_faidx):
+        """Every base of a record survives, across all of the lines it spans."""
+        sequences = wrapped_sequences_and_faidx[0].collect()
+        for row in sequences.iter_rows(named=True):
+            assert len(row['seq']) == TRANSCRIPT_LENGTHS[row['rname']]
+
+    def test_fasta_matches_unwrapped_fixture(self, wrapped_sequences_and_faidx, sequences):
+        assert_frame_equal(wrapped_sequences_and_faidx[0].collect(), sequences.collect())
+
+    def test_faidx_matches_unwrapped_fixture(self, wrapped_sequences_and_faidx, faidx):
+        assert_frame_equal(wrapped_sequences_and_faidx[1].collect(), faidx.collect())
+
+    def test_end_to_end_matches_unwrapped_fixture(self, wrapped_sequences_and_faidx, bin_cov_with_gc):
+        wrapped_sequences, wrapped_faidx = wrapped_sequences_and_faidx
+        result = calculate_gc_coverage(
+            BAM, wrapped_sequences, wrapped_faidx, fixed_length_bin_bp=BIN_BP
         ).collect()
         assert_frame_equal(
             result.sort('rname', 'bin_start'),
