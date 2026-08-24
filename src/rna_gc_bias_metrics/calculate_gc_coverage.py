@@ -427,14 +427,17 @@ def get_binned_coverage(bg, fixed_length_bin_bp, faidx):
 def get_bin_gc(bin_cov, fixed_length_bin_bp, sequences):
     '''Attach per-bin GC fraction and within-transcript normalized depth.
 
-    Computes each bin's GC fraction from the transcript sequence, joins it onto
-    the binned coverage, and adds `depth_normalized` (bin depth over the
-    transcript mean bin depth) and `gc_frac_rounded` (GC rounded to 2 dp).
+    Emits every bin of every transcript that has coverage anywhere, so bins no
+    read reached are reported with `depth_fractional` 0 rather than dropped.
+    Transcripts with no coverage at all are excluded (their `depth_normalized`
+    would be 0/0). `depth_normalized` is the bin's depth over the transcript's
+    mean bin depth, taken across all its bins including the zero ones.
 
     Example output:
         rname             | bin_start | depth_fractional | gc_frac | depth_normalized | gc_frac_rounded
-        ENST00000227525.8 | 1400      | 0.5              | 0.59    | 1.010101         | 0.59
-        ENST00000227525.8 | 1500      | 0.49             | 0.47    | 0.989899         | 0.47
+        ENST00000227525.8 | 1400      | 0.5              | 0.59    | 11.111111        | 0.59
+        ENST00000227525.8 | 1500      | 0.49             | 0.47    | 10.888889        | 0.47
+        ENST00000227525.8 | 1600      | 0.0              | 0.52    | 0.0              | 0.52
     '''
     bin_gc = sequences.join(
         bin_cov.select(pl.col('rname')).unique(),
@@ -450,22 +453,27 @@ def get_bin_gc(bin_cov, fixed_length_bin_bp, sequences):
     ).cast(
         {'seq':pl.String}
     ).select(
-        pl.col('rname','bin_start'),
+        pl.col('rname'),
+        pl.col('bin_start').cast(pl.UInt32),
         bin_seq = pl.col('seq').str.slice(pl.col('bin_start'), fixed_length_bin_bp)
     ).select(
         pl.col('rname','bin_start'),
         gc_frac = pl.col('bin_seq').str.count_matches('[GC]') / pl.col('bin_seq').str.len_chars()
     )
 
-    bin_cov_with_gc = bin_cov.cast(
-        {'bin_start':pl.UInt32}
-    ).join(
-        bin_gc,
-        on=['rname', 'bin_start']
+    # Left join from the full bin grid, so bins with no coverage survive as zeros
+    bin_cov_with_gc = bin_gc.join(
+        bin_cov.cast({'bin_start':pl.UInt32}),
+        on=['rname', 'bin_start'],
+        how='left'
+    ).with_columns(
+        pl.col('depth_fractional').fill_null(0.0)
     ).with_columns(
         depth_normalized = pl.col('depth_fractional') / pl.col('depth_fractional').mean().over('rname'),
         gc_frac_rounded = pl.col('gc_frac').round(2)
-    )
+    ).select(
+        'rname', 'bin_start', 'depth_fractional', 'gc_frac', 'depth_normalized', 'gc_frac_rounded'
+    ).sort('rname', 'bin_start')
 
     return bin_cov_with_gc
 

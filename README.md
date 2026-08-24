@@ -97,44 +97,62 @@ uv run python -m rna_gc_bias_metrics.calculate_gc_coverage \
 | `fp_bam` | Path to the BAM of reads aligned to the transcriptome. |
 | `-o`, `--outfp` | Output file path (default: stdout). |
 | `--fixed_length_bin_bp` | Bin size in base pairs (default: `100`). |
-| `--report_bin_count_for_full_transcriptome` | Also report, per GC fraction, the number of bins across *every* transcript in the FASTA (covered or not) — the background GC distribution to compare coverage against. |
+| `--report_bin_count_for_full_transcriptome` | Also report, per GC fraction, the number of bins across *every* transcript in the FASTA, including transcripts with no coverage at all — the background GC distribution to compare coverage against. |
 
 ### Output
 
-A tab-separated table, one row per rounded GC fraction:
+A tab-separated table, one row per rounded GC fraction. Every transcript with any
+coverage contributes *all* of its bins, so bins no read reached count as zero depth
+rather than being dropped — that is what makes a systematically uncovered GC range
+visible as a depleted signal instead of an absent one.
 
 | Column | Meaning |
 |---|---|
 | `gc_fraction` | GC fraction of the bin, rounded to two decimals (0–1). |
-| `mean_normalized_depth` | Mean within-transcript-normalized depth across covered bins at this GC fraction. `1.0` = transcript average; `> 1` enriched, `< 1` depleted. |
-| `transcriptome_bin_count` | Number of covered bins at this GC fraction. |
-| `transcriptome_bin_count_all_transcripts` | Bins at this GC fraction across all transcripts (only with `--report_bin_count_for_full_transcriptome`). |
+| `mean_normalized_depth` | Mean within-transcript-normalized depth at this GC fraction, over every bin of every transcript that has coverage somewhere. `1.0` = transcript average; `> 1` enriched, `< 1` depleted; `0.0` = no read reached any bin at this GC fraction. |
+| `transcriptome_bin_count` | Number of bins at this GC fraction, counted over transcripts that have coverage somewhere — i.e. bins interrogated, not bins that got reads. |
+| `transcriptome_bin_count_all_transcripts` | Bins at this GC fraction across *all* transcripts in the FASTA, whether or not they have any coverage (only with `--report_bin_count_for_full_transcriptome`). Always `>=` `transcriptome_bin_count`. |
 
-Example (run against the bundled test fixtures, abridged from 30 rows):
+Example (run against the bundled test fixtures — two of the four transcripts have
+coverage, contributing 30 bins between them):
 
 ```
 gc_fraction  mean_normalized_depth  transcriptome_bin_count  transcriptome_bin_count_all_transcripts
-0.24                                                         1
+0.24         0.0                    1                        1
 0.25                                                         1
-0.28                                                         1
-…
-0.47         0.9898989898989902     1                        1
-0.48                                                         2
+0.28         0.0                    1                        1
+0.33         0.0                    1                        2
+0.36                                                         1
+0.43         0.0                    1                        1
+0.46                                                         1
+0.47         10.888888888888891     1                        1
+0.48         0.0                    1                        2
 0.49                                                         2
-…
-0.59         1.01010101010101       1                        3
-…
-0.65         1.8133333333333332     1                        3
+0.5          0.0                    1                        1
+0.51         0.0                    1                        1
+0.52                                                         1
+0.53         0.0                    3                        5
+0.55                                                         1
+0.56         0.0                    3                        4
+0.57                                                         1
+0.58         0.0                    1                        5
+0.59         5.5555555555555545     2                        3
+0.6          0.0                    1                        2
+0.61         0.0                    1                        3
+0.62         0.0                    2                        3
+0.64                                                         2
+0.65         1.208888888888889      3                        3
 0.66                                                         2
-0.67                                                         3
-0.68         0.26666666666666683    1                        1
-0.7          0.18666666666666737    1                        1
-0.71                                                         2
-0.77         1.7333333333333325     1                        1
+0.67         0.0                    2                        3
+0.68         0.5333333333333337     1                        1
+0.7          0.37333333333333474    1                        1
+0.71         0.0                    1                        2
+0.77         3.466666666666665      1                        1
 ```
 
-(GC fractions with no covered bins have empty depth/count columns but still
-appear when the full-transcriptome background is reported.)
+(GC fractions occurring only in transcripts with no coverage at all have empty
+depth/count columns, but still appear when the full-transcriptome background is
+reported.)
 
 ## Python API
 
@@ -156,9 +174,11 @@ per_gc_coverage = calculate_gc_pct_coverage(bin_cov_with_gc).collect()
 
 `calculate_gc_coverage` returns a per-bin table (`rname`, `bin_start`,
 `depth_fractional`, `gc_frac`, `depth_normalized`, `gc_frac_rounded`) as a Polars
-`LazyFrame`; call `.collect()` to materialize it. `load_bam`, `expand_cigar`,
-`bam_to_bedgraph`, `get_binned_coverage`, and `get_bin_gc` expose the individual
-stages.
+`LazyFrame`; call `.collect()` to materialize it. It holds every bin of every
+transcript that has coverage somewhere, with `depth_fractional` 0 for bins no read
+reached. `load_bam`, `expand_cigar`, `bam_to_bedgraph`, `get_binned_coverage`, and
+`get_bin_gc` expose the individual stages — note that `get_binned_coverage` alone
+emits only bins that received coverage; the zero bins are filled in by `get_bin_gc`.
 
 ## Notes and limitations
 

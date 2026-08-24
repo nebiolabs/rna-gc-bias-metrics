@@ -263,9 +263,43 @@ class TestGetBinnedCoverage:
 # ---------------------------------------------------------------------------
 # 7. get_bin_gc
 # ---------------------------------------------------------------------------
+#  Per-bin GC fraction of the two covered transcripts, in sorted order (the enum
+#  category order puts ENST00000227525.8 first). GC depends only on the sequence
+#  and the bin boundaries, never on coverage, so this covers all 30 emitted bins.
+GC_FRAC = [
+    #  ENST00000227525.8, 2129bp -> 22 bins, the last a 29bp remainder
+    0.62, 0.53, 0.56, 0.56, 0.62, 0.65, 0.65, 0.71, 0.67, 0.61, 0.56,
+    0.58, 0.53, 0.60, 0.59, 0.47, 0.53, 0.59, 0.67, 0.50, 0.33, 7 / 29,
+    #  ENST00000438571.5, 792bp -> 8 bins, the last a 92bp remainder
+    0.77, 0.68, 0.65, 0.70, 0.48, 0.51, 0.28, 40 / 92,
+]
+
+#  The bins that carry coverage in the test.bam fixture, in sorted order. Every
+#  other bin of these two transcripts is emitted with zero depth; the remaining
+#  two transcripts have no coverage at all and are absent entirely.
+#  Only the depth columns need this split -- an assertion about a
+#  coverage-independent column (gc_frac, gc_frac_rounded) belongs on all 30 bins.
+COVERED_BINS = [
+    ('ENST00000227525.8', 1400), ('ENST00000227525.8', 1500),
+    ('ENST00000438571.5', 0), ('ENST00000438571.5', 100),
+    ('ENST00000438571.5', 200), ('ENST00000438571.5', 300),
+]
+
+
+def _split_on_coverage(df):
+    """(rows that received coverage, rows that did not), each in sorted order."""
+    keys = {f'{rname}:{bin_start}' for rname, bin_start in COVERED_BINS}
+    is_covered = pl.concat_str(
+        pl.col('rname').cast(pl.String), pl.col('bin_start'), separator=':'
+    ).is_in(keys)
+    df = df.sort('rname', 'bin_start')
+    return df.filter(is_covered), df.filter(~is_covered)
+
+
 class TestGetBinGc:
     def test_shape(self, bin_cov_with_gc):
-        assert bin_cov_with_gc.collect().shape == (6, 6)
+        """All 22 bins of the 2129bp transcript and all 8 of the 792bp one."""
+        assert bin_cov_with_gc.collect().shape == (30, 6)
 
     def test_columns(self, bin_cov_with_gc):
         assert bin_cov_with_gc.collect().columns == [
@@ -274,18 +308,50 @@ class TestGetBinGc:
 
     def test_gc_frac_values(self, bin_cov_with_gc):
         df = bin_cov_with_gc.collect().sort('rname', 'bin_start')
-        assert df['gc_frac'].to_list() == [0.59, 0.47, 0.77, 0.68, 0.65, 0.70]
-
-    def test_depth_normalized_values(self, bin_cov_with_gc):
-        df = bin_cov_with_gc.collect().sort('rname', 'bin_start')
-        values = df['depth_normalized'].to_list()
-        expected = [1.010101, 0.989899, 1.733333, 0.266667, 1.813333, 0.186667]
-        for actual, exp in zip(values, expected):
-            assert abs(actual - exp) < 1e-4
+        assert df['gc_frac'].to_list() == GC_FRAC
 
     def test_gc_frac_rounded_values(self, bin_cov_with_gc):
+        """Only the two remainder bins have a GC fraction that is not already 2dp,
+        so they are the only ones that exercise the rounding at all: 7/29 -> 0.24
+        and 40/92 -> 0.43."""
         df = bin_cov_with_gc.collect().sort('rname', 'bin_start')
-        assert df['gc_frac_rounded'].to_list() == [0.59, 0.47, 0.77, 0.68, 0.65, 0.70]
+        assert df['gc_frac_rounded'].to_list() == [
+            0.62, 0.53, 0.56, 0.56, 0.62, 0.65, 0.65, 0.71, 0.67, 0.61, 0.56,
+            0.58, 0.53, 0.60, 0.59, 0.47, 0.53, 0.59, 0.67, 0.50, 0.33, 0.24,
+            0.77, 0.68, 0.65, 0.70, 0.48, 0.51, 0.28, 0.43,
+        ]
+
+    def test_depth_normalized_values(self, bin_cov_with_gc):
+        """Normalized against the transcript mean over *all* bins, so a covered
+        bin's value scales with how much of its transcript went uncovered: x11 for
+        ENST00000227525.8 (2 of 22 bins covered), x2 for ENST00000438571.5 (4 of 8).
+        """
+        covered, uncovered = _split_on_coverage(bin_cov_with_gc.collect())
+        expected = [11.111111, 10.888889, 3.466667, 0.533333, 3.626667, 0.373333]
+        for actual, exp in zip(covered['depth_normalized'].to_list(), expected):
+            assert abs(actual - exp) < 1e-4
+        #  Pins the remaining 24 bins, so both depth columns are asserted in full
+        assert (uncovered['depth_normalized'] == 0.0).all()
+        assert (uncovered['depth_fractional'] == 0.0).all()
+
+    def test_uncovered_bins_are_emitted_as_zero(self, bin_cov_with_gc):
+        """A bin with no reads is reported with zero depth rather than dropped, even
+        when other bins of the same transcript are covered. ENST00000438571.5 is
+        covered only at its head (bins 0-300), while ENST00000227525.8 is covered
+        only in the middle (1400, 1500) and so must emit zeros on both sides."""
+        df = bin_cov_with_gc.collect()
+        for rname, expected_bins in [
+            ('ENST00000227525.8', list(range(0, 2200, 100))),
+            ('ENST00000438571.5', list(range(0, 800, 100))),
+        ]:
+            transcript = df.filter(pl.col('rname').cast(pl.String) == rname).sort('bin_start')
+            assert transcript['bin_start'].to_list() == expected_bins
+            assert transcript['gc_frac'].null_count() == 0
+
+    def test_transcripts_without_any_coverage_are_excluded(self, bin_cov_with_gc):
+        """Zero-coverage transcripts stay out; their depth_normalized would be 0/0."""
+        rnames = bin_cov_with_gc.collect()['rname'].cast(pl.String).unique().to_list()
+        assert sorted(rnames) == ['ENST00000227525.8', 'ENST00000438571.5']
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +360,7 @@ class TestGetBinGc:
 class TestCalculateGcCoverage:
     def test_shape(self, sequences, faidx):
         result = calculate_gc_coverage(BAM, sequences, faidx, fixed_length_bin_bp=BIN_BP).collect()
-        assert result.shape == (6, 6)
+        assert result.shape == (30, 6)
 
     def test_columns(self, sequences, faidx):
         result = calculate_gc_coverage(BAM, sequences, faidx, fixed_length_bin_bp=BIN_BP).collect()
@@ -315,19 +381,32 @@ class TestCalculateGcCoverage:
 # ---------------------------------------------------------------------------
 # 9. calculate_gc_pct_coverage
 # ---------------------------------------------------------------------------
+#  Every rounded GC fraction present across the 30 bins, in sorted order.
+GC_FRACTIONS = [
+    0.24, 0.28, 0.33, 0.43, 0.47, 0.48, 0.50, 0.51, 0.53, 0.56, 0.58,
+    0.59, 0.60, 0.61, 0.62, 0.65, 0.67, 0.68, 0.70, 0.71, 0.77,
+]
+
+
 class TestCalculateGcPctCoverage:
     def test_shape(self, bin_cov_with_gc):
         result = calculate_gc_pct_coverage(bin_cov_with_gc).collect()
-        assert result.shape == (6, 2)
+        assert result.shape == (21, 2)
 
     def test_columns(self, bin_cov_with_gc):
         result = calculate_gc_pct_coverage(bin_cov_with_gc).collect()
         assert result.columns == ['gc_frac_rounded', 'depth_normalized']
 
     def test_exact_values(self, bin_cov_with_gc):
+        """GC fractions reached by no read average to zero rather than vanishing.
+        0.59 and 0.65 each mix a covered bin with uncovered ones, so they average
+        below the covered bin's own normalized depth."""
         result = calculate_gc_pct_coverage(bin_cov_with_gc).collect().sort('gc_frac_rounded')
-        assert result['gc_frac_rounded'].to_list() == [0.47, 0.59, 0.65, 0.68, 0.70, 0.77]
-        expected_depths = [0.989899, 1.010101, 1.813333, 0.266667, 0.186667, 1.733333]
+        assert result['gc_frac_rounded'].to_list() == GC_FRACTIONS
+        expected_depths = [
+            0.0, 0.0, 0.0, 0.0, 10.888889, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            5.555556, 0.0, 0.0, 0.0, 1.208889, 0.0, 0.533333, 0.373333, 0.0, 3.466667,
+        ]
         for actual, exp in zip(result['depth_normalized'].to_list(), expected_depths):
             assert abs(actual - exp) < 1e-4
 
@@ -338,16 +417,23 @@ class TestCalculateGcPctCoverage:
 class TestCalculateGcPctFrequency:
     def test_shape(self, bin_cov_with_gc):
         result = calculate_gc_pct_frequency(bin_cov_with_gc).collect()
-        assert result.shape == (6, 2)
+        assert result.shape == (21, 2)
 
     def test_columns(self, bin_cov_with_gc):
         result = calculate_gc_pct_frequency(bin_cov_with_gc).collect()
         assert result.columns == ['gc_frac_rounded', 'count']
 
-    def test_all_counts_are_one(self, bin_cov_with_gc):
+    def test_exact_counts(self, bin_cov_with_gc):
         result = calculate_gc_pct_frequency(bin_cov_with_gc).collect().sort('gc_frac_rounded')
-        assert result['gc_frac_rounded'].to_list() == [0.47, 0.59, 0.65, 0.68, 0.70, 0.77]
-        assert result['count'].to_list() == [1, 1, 1, 1, 1, 1]
+        assert result['gc_frac_rounded'].to_list() == GC_FRACTIONS
+        assert result['count'].to_list() == [
+            1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 1, 2, 1, 1, 2, 3, 2, 1, 1, 1, 1
+        ]
+
+    def test_counts_every_bin_of_the_covered_transcripts(self, bin_cov_with_gc):
+        """The counts are bins interrogated, not bins that happened to get reads."""
+        result = calculate_gc_pct_frequency(bin_cov_with_gc).collect()
+        assert result['count'].sum() == 30
 
 
 # ---------------------------------------------------------------------------
@@ -393,12 +479,13 @@ class TestExactBinCoordinates:
         assert row['end'] == 10
 
     def test_no_coverage_leaks_past_read_span(self, pipeline):
-        """The read lies entirely in bin 0, so the 100% GC bin at bin_start 10
-        carries no coverage: it is either absent from the output or present with
-        zero depth (both encode 'no coverage in this bin')."""
+        """The read lies entirely in bin 0, so the 100% GC bin at bin_start 10 is
+        reported with zero depth -- present (chrDemo has coverage elsewhere) but
+        carrying none of it."""
         _, bin_cov_with_gc = pipeline
-        bin_past_read = bin_cov_with_gc.filter(pl.col('bin_start') == 10)
-        assert bin_past_read.is_empty() or (bin_past_read['depth_fractional'] == 0).all()
+        row = bin_cov_with_gc.filter(pl.col('bin_start') == 10).row(0, named=True)
+        assert row['gc_frac'] == 1.0
+        assert row['depth_fractional'] == 0.0
 
     @pytest.fixture(scope="class")
     def start_coord_bin_cov_with_gc(self, seqs_faidx):
