@@ -97,7 +97,26 @@ uv run python -m rna_gc_bias_metrics.calculate_gc_coverage \
 | `fp_bam` | Path to the BAM of reads aligned to the transcriptome. |
 | `-o`, `--outfp` | Output file path (default: stdout). |
 | `--fixed_length_bin_bp` | Bin size in base pairs (default: `100`). |
+| `--min_transcript_read_count` | Drop transcripts with fewer than this many fragments before calculating GC bias (default: no filter). |
+| `--min_transcript_cpm` | Drop transcripts below this many fragments per million before calculating GC bias (default: no filter). |
 | `--report_bin_count_for_full_transcriptome` | Also report, per GC fraction, the number of bins across *every* transcript in the FASTA, including transcripts with no coverage at all — the background GC distribution to compare coverage against. |
+
+### Transcript depth filters
+
+Because each transcript's bins are normalized against that transcript's own mean
+bin depth, a transcript covered by one or two reads contributes a single wildly
+enriched bin and a long tail of zeros — noise at whatever GC fractions it happens
+to span. `--min_transcript_read_count` and `--min_transcript_cpm` drop such
+transcripts before the profile is built. Both are optional; given together, a
+transcript must clear both. Thresholds are inclusive, so
+`--min_transcript_read_count 5` drops transcripts with 4 fragments or fewer.
+
+Depth is counted in **fragments**, not alignment records: a proper pair counts
+once, and so does a single-end read. The CPM denominator is the total number of
+fragments the tool retains — mapped, non-secondary, non-supplementary, and either
+single-end or properly paired — so CPM sums to 1,000,000 across transcripts. How
+many transcripts survived is reported on stderr; if none do, the run fails with an
+error naming the thresholds and the deepest transcript observed.
 
 ### Output
 
@@ -105,6 +124,11 @@ A tab-separated table, one row per rounded GC fraction. Every transcript with an
 coverage contributes *all* of its bins, so bins no read reached count as zero depth
 rather than being dropped — that is what makes a systematically uncovered GC range
 visible as a depleted signal instead of an absent one.
+
+A transcript excluded by a depth filter leaves the table entirely, zero bins
+included, lowering `mean_normalized_depth` contributions and `transcriptome_bin_count`
+alike. `transcriptome_bin_count_all_transcripts` is measured on the FASTA alone and
+stays the whole-transcriptome background regardless of filtering.
 
 | Column | Meaning |
 |---|---|
@@ -166,7 +190,10 @@ from rna_gc_bias_metrics.calculate_gc_coverage import (
 )
 
 sequences, faidx = load_sequences("transcripts.fa", "transcripts.fa.fai")
-bin_cov_with_gc = calculate_gc_coverage("reads.bam", sequences, faidx, fixed_length_bin_bp=100)
+bin_cov_with_gc = calculate_gc_coverage(
+    "reads.bam", sequences, faidx, fixed_length_bin_bp=100,
+    min_transcript_read_count=None, min_transcript_cpm=None,
+)
 
 # mean normalized depth per rounded GC fraction
 per_gc_coverage = calculate_gc_pct_coverage(bin_cov_with_gc).collect()
@@ -179,6 +206,8 @@ transcript that has coverage somewhere, with `depth_fractional` 0 for bins no re
 reached. `load_bam`, `expand_cigar`, `bam_to_bedgraph`, `get_binned_coverage`, and
 `get_bin_gc` expose the individual stages — note that `get_binned_coverage` alone
 emits only bins that received coverage; the zero bins are filled in by `get_bin_gc`.
+`get_transcript_fragment_counts` and `filter_transcripts_by_depth` implement the
+depth filters and can be applied to a `load_bam` frame directly.
 
 ## Notes and limitations
 

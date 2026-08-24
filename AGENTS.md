@@ -32,6 +32,20 @@ rest of the pipeline (and the tests) working on SAM-style column names/dtypes:
 - There is **no downsampling** — `polars-bio` does not provide it and the
   feature was dropped along with the `--downsample` CLI flag.
 
+## Transcript depth filters (`filter_transcripts_by_depth`)
+
+`--min_transcript_read_count` / `--min_transcript_cpm` drop whole transcripts from
+the profile before `expand_cigar`, counting **fragments**: `(~FPAIRED) | (side ==
+'R1')`. Single-end reads are picked up by `~FPAIRED` rather than by the R1 label,
+because conventional single-end records set no READ1 bit and `load_bam` therefore
+labels them `side` `'R2'`.
+
+The CPM denominator is deliberately pinned to the fragments surviving `load_bam`'s
+existing flag filters (mapped, non-secondary, non-supplementary, single-end or
+proper pair). **A new read-level filter must be applied after this count**, not
+before it — otherwise the library size shrinks with the filtering and CPM stops
+meaning fragments per million sequenced.
+
 ## Reference names (`_normalize_rname`)
 
 The FASTA, the `.fa.fai` and the BAM must agree on `rname`/`RNAME` for the joins

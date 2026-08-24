@@ -6,6 +6,8 @@ from polars.testing import assert_frame_equal
 from rna_gc_bias_metrics.calculate_gc_coverage import (
     load_sequences,
     load_bam,
+    get_transcript_fragment_counts,
+    filter_transcripts_by_depth,
     expand_cigar,
     bam_to_bedgraph,
     get_binned_coverage,
@@ -707,3 +709,124 @@ class TestWrappedFasta:
             result.sort('rname', 'bin_start'),
             bin_cov_with_gc.collect().sort('rname', 'bin_start')
         )
+
+
+# ---------------------------------------------------------------------------
+# 15. Transcript depth filters
+# ---------------------------------------------------------------------------
+def _alignments(*rows):
+    """Build the subset of load_bam's output that the depth filters read."""
+    return pl.LazyFrame(
+        list(rows),
+        schema={'RNAME': pl.String, 'FPAIRED': pl.Boolean, 'side': pl.String},
+        orient='row'
+    )
+
+
+def _pairs(rname, n):
+    """`n` proper pairs on `rname`, as the two alignment rows each occupies."""
+    return [(rname, True, 'R1'), (rname, True, 'R2')] * n
+
+
+def _single_end(rname, n):
+    """`n` single-end reads on `rname`. load_bam labels these 'R2' (no READ1 bit)."""
+    return [(rname, False, 'R2')] * n
+
+
+def _counts(bam_df):
+    return dict(
+        get_transcript_fragment_counts(bam_df).collect().iter_rows()
+    )
+
+
+def _kept(bam_df, **kwargs):
+    return set(
+        filter_transcripts_by_depth(bam_df, **kwargs).collect()['RNAME'].to_list()
+    )
+
+
+class TestTranscriptFragmentCounts:
+    def test_proper_pair_counts_once(self):
+        bam_df = _alignments(*_pairs('A', 3))
+        assert bam_df.collect().height == 6
+        assert _counts(bam_df) == {'A': 3}
+
+    def test_single_end_read_counts_once(self):
+        assert _counts(_alignments(*_single_end('A', 3))) == {'A': 3}
+
+    def test_counts_are_per_transcript(self):
+        bam_df = _alignments(*_pairs('A', 2), *_single_end('B', 5))
+        assert _counts(bam_df) == {'A': 2, 'B': 5}
+
+
+class TestFilterTranscriptsByDepth:
+    def test_read_count_threshold_is_inclusive(self):
+        bam_df = _alignments(*_pairs('A', 5), *_pairs('B', 4))
+        assert _kept(bam_df, min_read_count=5) == {'A'}
+
+    def test_cpm_threshold_is_inclusive(self):
+        # 1 and 9 of 10 total fragments -> 100,000 and 900,000 CPM
+        bam_df = _alignments(*_pairs('A', 1), *_pairs('B', 9))
+        assert _kept(bam_df, min_cpm=100_000) == {'A', 'B'}
+        assert _kept(bam_df, min_cpm=100_001) == {'B'}
+
+    def test_cpm_denominator_includes_dropped_transcripts(self):
+        # A is 1 of 100 total fragments; if the denominator were the surviving
+        # fragments only, A would be 1e6 CPM and survive any threshold.
+        bam_df = _alignments(*_pairs('A', 1), *_pairs('B', 99))
+        assert _kept(bam_df, min_cpm=10_000) == {'A', 'B'}
+        assert _kept(bam_df, min_cpm=10_001) == {'B'}
+
+    def test_thresholds_combine_with_and(self):
+        # of 10 fragments: A 5 (500,000 CPM), B 3 (300,000), C 2 (200,000)
+        bam_df = _alignments(*_pairs('A', 5), *_pairs('B', 3), *_pairs('C', 2))
+        assert _kept(bam_df, min_read_count=3) == {'A', 'B'}
+        assert _kept(bam_df, min_cpm=400_000) == {'A'}
+        assert _kept(bam_df, min_read_count=3, min_cpm=400_000) == {'A'}
+
+    def test_all_alignments_of_a_kept_transcript_survive(self):
+        bam_df = _alignments(*_pairs('A', 2), *_pairs('B', 1))
+        assert filter_transcripts_by_depth(bam_df, min_read_count=2).collect().height == 4
+
+    def test_raises_when_no_transcript_passes(self):
+        bam_df = _alignments(*_pairs('A', 2), *_pairs('B', 1))
+        with pytest.raises(ValueError, match='min_transcript_read_count=3'):
+            filter_transcripts_by_depth(bam_df, min_read_count=3)
+
+    def test_reports_kept_transcripts_on_stderr(self, capsys):
+        bam_df = _alignments(*_pairs('A', 2), *_pairs('B', 1))
+        filter_transcripts_by_depth(bam_df, min_read_count=2)
+        assert 'kept 1 of 2 covered transcripts' in capsys.readouterr().err
+
+
+class TestDepthFilteredGcCoverage:
+    """End to end on the fixture BAM: two covered transcripts, one fragment each."""
+
+    def test_permissive_threshold_leaves_profile_unchanged(self, sequences, faidx, bin_cov_with_gc):
+        result = calculate_gc_coverage(
+            BAM, sequences, faidx, fixed_length_bin_bp=BIN_BP,
+            min_transcript_read_count=1
+        ).collect()
+        assert_frame_equal(result, bin_cov_with_gc.collect())
+
+    def test_cpm_threshold_at_observed_depth_leaves_profile_unchanged(self, sequences, faidx, bin_cov_with_gc):
+        # Each of the two transcripts holds one of the two fragments.
+        result = calculate_gc_coverage(
+            BAM, sequences, faidx, fixed_length_bin_bp=BIN_BP,
+            min_transcript_cpm=500_000
+        ).collect()
+        assert_frame_equal(result, bin_cov_with_gc.collect())
+
+    def test_threshold_above_observed_depth_raises(self, sequences, faidx):
+        with pytest.raises(ValueError, match='No transcript meets the depth thresholds'):
+            calculate_gc_coverage(
+                BAM, sequences, faidx, fixed_length_bin_bp=BIN_BP,
+                min_transcript_read_count=2
+            ).collect()
+
+    def test_cpm_threshold_above_observed_depth_raises(self, sequences, faidx):
+        with pytest.raises(ValueError, match='No transcript meets the depth thresholds'):
+            calculate_gc_coverage(
+                BAM, sequences, faidx, fixed_length_bin_bp=BIN_BP,
+                min_transcript_cpm=500_001
+            ).collect()

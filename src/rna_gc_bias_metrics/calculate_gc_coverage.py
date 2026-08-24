@@ -1,5 +1,6 @@
 
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -206,6 +207,86 @@ def load_bam(fp_bam, transcript_categories=None):
     #     raise ValueError('Expects one alignment per side per pair')
 
     return bam_df
+
+
+def get_transcript_fragment_counts(bam_df):
+    '''Count fragments -- not alignments -- per transcript.
+
+    A proper pair contributes one fragment, counted at its R1 mate; a single-end
+    read contributes one. Single-end reads are identified by `~FPAIRED` rather
+    than by the R1 label, because conventional single-end records set no READ1
+    bit (flag 0/16) and so are labelled `side` 'R2' by `load_bam`.
+
+    Example output:
+        rname             | fragment_count
+        ENST00000227525.8 | 1
+        ENST00000438571.5 | 1
+    '''
+    return bam_df.filter(
+        (~pl.col('FPAIRED')) | (pl.col('side') == 'R1')
+    ).group_by(
+        pl.col('RNAME').alias('rname')
+    ).agg(
+        pl.len().alias('fragment_count')
+    )
+
+
+def filter_transcripts_by_depth(bam_df, min_read_count=None, min_cpm=None):
+    '''Drop alignments on transcripts below a fragment-count and/or CPM threshold.
+
+    Thresholds are inclusive (`min_read_count=5` keeps transcripts with 5 or more
+    fragments) and combine with AND. A dropped transcript leaves the profile
+    entirely, zero bins included, because `get_bin_gc` builds its bin grid from
+    whichever transcripts still have coverage. Raises if no transcript clears the
+    thresholds; reports what was kept on stderr.
+    '''
+    thresholds = (
+        f"min_transcript_read_count={min_read_count}, min_transcript_cpm={min_cpm}"
+    )
+
+    counts = get_transcript_fragment_counts(bam_df).collect()
+    if counts.height == 0:
+        raise ValueError(
+            f"The BAM has no fragments left to apply the depth thresholds to "
+            f"({thresholds})."
+        )
+
+    # The CPM denominator is every fragment that reaches this point: mapped,
+    # non-secondary, non-supplementary, and either single-end or properly paired.
+    # Any read filter added later must run after this count, or transcripts would
+    # be scored against a library size that shrinks along with the filtering.
+    total_fragments = counts['fragment_count'].sum()
+    counts = counts.with_columns(
+        cpm = pl.col('fragment_count') / total_fragments * 1e6
+    )
+
+    keep = counts
+    if min_read_count is not None:
+        keep = keep.filter(pl.col('fragment_count') >= min_read_count)
+    if min_cpm is not None:
+        keep = keep.filter(pl.col('cpm') >= min_cpm)
+
+    if keep.height == 0:
+        deepest = counts.sort('fragment_count', descending=True).row(0, named=True)
+        raise ValueError(
+            f"No transcript meets the depth thresholds ({thresholds}). The deepest "
+            f"of {counts.height} covered transcript(s), {deepest['rname']}, has "
+            f"{deepest['fragment_count']} fragment(s) / {deepest['cpm']:,.2f} CPM, "
+            f"out of {total_fragments} total fragments."
+        )
+
+    print(
+        f"Transcript depth filter: kept {keep.height} of {counts.height} covered "
+        f"transcripts ({thresholds}; {total_fragments} total fragments)",
+        file=sys.stderr
+    )
+
+    return bam_df.join(
+        keep.lazy().select('rname'),
+        left_on='RNAME',
+        right_on='rname',
+        how='semi'
+    )
 
 
 def expand_cigar(bam_df):
@@ -507,10 +588,15 @@ def plot(bin_cov_with_gc):
     return (lineplot + histplot).cols(1)
 
 
-def calculate_gc_coverage(fp_bam, sequences, faidx, fixed_length_bin_bp=100):
+def calculate_gc_coverage(fp_bam, sequences, faidx, fixed_length_bin_bp=100,
+                          min_transcript_read_count=None, min_transcript_cpm=None):
     '''Run the full BAM→binned GC-vs-coverage pipeline for one BAM.'''
     transcript_categories = faidx.collect_schema()['rname'].categories
     bam_df = load_bam(fp_bam, transcript_categories=transcript_categories)
+    if min_transcript_read_count is not None or min_transcript_cpm is not None:
+        bam_df = filter_transcripts_by_depth(
+            bam_df, min_transcript_read_count, min_transcript_cpm
+        )
     expanded_cigar_df = expand_cigar(bam_df)
     bg = bam_to_bedgraph(expanded_cigar_df)
     bin_cov = get_binned_coverage(bg, fixed_length_bin_bp, faidx)
@@ -604,11 +690,30 @@ def main():
         help='Length of each bin in base pairs (default: 100).'
     )
     parser.add_argument(
+        '--min_transcript_read_count',
+        type=int,
+        default=None,
+        help='Drop transcripts with fewer than this many fragments before calculating '
+             'GC bias. A proper pair counts as one fragment (default: no filter).'
+    )
+    parser.add_argument(
+        '--min_transcript_cpm',
+        type=float,
+        default=None,
+        help='Drop transcripts below this many fragments per million before calculating '
+             'GC bias (default: no filter).'
+    )
+    parser.add_argument(
         '--report_bin_count_for_full_transcriptome',
         action='store_true',
         help='Whether to calculate and report the frequency of each GC percentage bin across the full transcriptome'
     )
     args = parser.parse_args()
+
+    if args.min_transcript_read_count is not None and args.min_transcript_read_count < 0:
+        parser.error('--min_transcript_read_count must be non-negative')
+    if args.min_transcript_cpm is not None and args.min_transcript_cpm < 0:
+        parser.error('--min_transcript_cpm must be non-negative')
 
     fp_faidx = args.fp_fasta.with_suffix('.fa.fai')
     if not fp_faidx.exists():
@@ -621,6 +726,8 @@ def main():
         sequences,
         faidx,
         fixed_length_bin_bp=args.fixed_length_bin_bp,
+        min_transcript_read_count=args.min_transcript_read_count,
+        min_transcript_cpm=args.min_transcript_cpm,
     )
 
     per_gc_pct_coverage = calculate_gc_pct_coverage(bin_cov_with_gc)
