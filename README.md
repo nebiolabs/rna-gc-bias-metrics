@@ -114,9 +114,38 @@ transcript must clear both. Thresholds are inclusive, so
 Depth is counted in **fragments**, not alignment records: a proper pair counts
 once, and so does a single-end read. The CPM denominator is the total number of
 fragments the tool retains — mapped, non-secondary, non-supplementary, and either
-single-end or properly paired — so CPM sums to 1,000,000 across transcripts. How
-many transcripts survived is reported on stderr; if none do, the run fails with an
-error naming the thresholds and the deepest transcript observed.
+single-end or properly paired — so CPM sums to 1,000,000 across transcripts.
+Thresholds that nothing clears give an empty profile rather than an error, so an
+over-strict setting stays a tuning outcome. How many transcripts reached the
+profile is recorded in the run report (see below).
+
+### Run report
+
+Every run writes a JSON report beside its TSV — `out.tsv` yields
+`out.report.json` — recording the tool version, the inputs, the parameters, and
+how many transcripts reached the profile. When the TSV goes to stdout there is no
+sidecar path, so the report goes to stderr instead and the piped TSV stays clean.
+
+```json
+{
+  "tool": {"name": "rna-gc-bias-metrics", "version": "0.3.0"},
+  "inputs": {"fasta": "transcripts.fa", "bam": "reads.bam", "output": "out.tsv"},
+  "parameters": {
+    "fixed_length_bin_bp": 100,
+    "min_transcript_read_count": null,
+    "min_transcript_cpm": null,
+    "report_bin_count_for_full_transcriptome": false
+  },
+  "transcripts": {"in_profile": 2, "in_transcriptome": 4}
+}
+```
+
+`in_profile` counts transcripts that reached the profile, and the two reasons for
+falling short of `in_transcriptome` are not distinguishable from it: transcripts
+with no reads passing the BAM flag filters (mapped, non-secondary,
+non-supplementary, single-end or proper pair) are never included, and covered
+transcripts may be additionally excluded by the min-depth filters. To see what a
+threshold itself removed, compare `in_profile` against a run without it.
 
 ### Output
 
@@ -193,6 +222,7 @@ sequences, faidx = load_sequences("transcripts.fa", "transcripts.fa.fai")
 bin_cov_with_gc = calculate_gc_coverage(
     "reads.bam", sequences, faidx, fixed_length_bin_bp=100,
     min_transcript_read_count=None, min_transcript_cpm=None,
+    library_size=None,
 )
 
 # mean normalized depth per rounded GC fraction
@@ -207,7 +237,14 @@ reached. `load_bam`, `expand_cigar`, `bam_to_bedgraph`, `get_binned_coverage`, a
 `get_bin_gc` expose the individual stages — note that `get_binned_coverage` alone
 emits only bins that received coverage; the zero bins are filled in by `get_bin_gc`.
 `get_transcript_fragment_counts` and `filter_transcripts_by_depth` implement the
-depth filters and can be applied to a `load_bam` frame directly.
+depth filters and can be applied to a `load_bam` frame directly; both are lazy and
+report nothing, so they compose into a larger query without forcing a collect.
+
+`library_size` overrides the CPM denominator. Left unset it is the fragment count
+the tool retains, which moves whenever the read-level filters change — a caller
+whose filters are tunable after load should pin it to a library size fixed at load
+time, or CPM stops meaning fragments per million sequenced. It is a Python-API
+argument only; the CLI always computes the denominator from the BAM.
 
 ## Notes and limitations
 

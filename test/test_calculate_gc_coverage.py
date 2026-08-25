@@ -1,4 +1,8 @@
+import json
 import os
+import sys
+from pathlib import Path
+
 import pytest
 import polars as pl
 from polars.testing import assert_frame_equal
@@ -15,6 +19,9 @@ from rna_gc_bias_metrics.calculate_gc_coverage import (
     calculate_gc_coverage,
     calculate_gc_pct_coverage,
     calculate_gc_pct_frequency,
+    build_run_report,
+    report_path,
+    main,
 )
 
 FIXTURES = os.path.join(os.path.dirname(__file__), 'fixtures')
@@ -788,15 +795,25 @@ class TestFilterTranscriptsByDepth:
         bam_df = _alignments(*_pairs('A', 2), *_pairs('B', 1))
         assert filter_transcripts_by_depth(bam_df, min_read_count=2).collect().height == 4
 
-    def test_raises_when_no_transcript_passes(self):
+    def test_empty_when_no_transcript_passes(self):
+        # An over-strict threshold is a tuning outcome, not an error.
         bam_df = _alignments(*_pairs('A', 2), *_pairs('B', 1))
-        with pytest.raises(ValueError, match='min_transcript_read_count=3'):
-            filter_transcripts_by_depth(bam_df, min_read_count=3)
+        assert filter_transcripts_by_depth(bam_df, min_read_count=3).collect().height == 0
 
-    def test_reports_kept_transcripts_on_stderr(self, capsys):
-        bam_df = _alignments(*_pairs('A', 2), *_pairs('B', 1))
-        filter_transcripts_by_depth(bam_df, min_read_count=2)
-        assert 'kept 1 of 2 covered transcripts' in capsys.readouterr().err
+    def test_injected_library_size_overrides_the_denominator(self):
+        # One fragment of two observed is 500,000 CPM against the BAM, but only
+        # 10,000 CPM against a library of 100.
+        bam_df = _alignments(*_pairs('A', 1), *_pairs('B', 1))
+        assert _kept(bam_df, min_cpm=500_000) == {'A', 'B'}
+        assert _kept(bam_df, min_cpm=10_000, library_size=100) == {'A', 'B'}
+        assert _kept(bam_df, min_cpm=10_001, library_size=100) == set()
+
+    def test_injected_library_size_replaces_the_observed_denominator(self):
+        # 100 fragments observed and A holds one of them: 10,000 CPM against the
+        # BAM, but 5,000 against a declared library of 200.
+        bam_df = _alignments(*_pairs('A', 1), *_pairs('B', 99))
+        assert _kept(bam_df, min_cpm=7_500) == {'A', 'B'}
+        assert _kept(bam_df, min_cpm=7_500, library_size=200) == {'B'}
 
 
 class TestDepthFilteredGcCoverage:
@@ -817,16 +834,107 @@ class TestDepthFilteredGcCoverage:
         ).collect()
         assert_frame_equal(result, bin_cov_with_gc.collect())
 
-    def test_threshold_above_observed_depth_raises(self, sequences, faidx):
-        with pytest.raises(ValueError, match='No transcript meets the depth thresholds'):
-            calculate_gc_coverage(
-                BAM, sequences, faidx, fixed_length_bin_bp=BIN_BP,
-                min_transcript_read_count=2
-            ).collect()
+    def test_threshold_above_observed_depth_gives_an_empty_profile(self, sequences, faidx):
+        result = calculate_gc_coverage(
+            BAM, sequences, faidx, fixed_length_bin_bp=BIN_BP,
+            min_transcript_read_count=2
+        ).collect()
+        assert result.height == 0
 
-    def test_cpm_threshold_above_observed_depth_raises(self, sequences, faidx):
-        with pytest.raises(ValueError, match='No transcript meets the depth thresholds'):
-            calculate_gc_coverage(
-                BAM, sequences, faidx, fixed_length_bin_bp=BIN_BP,
-                min_transcript_cpm=500_001
-            ).collect()
+    def test_cpm_threshold_above_observed_depth_gives_an_empty_profile(self, sequences, faidx):
+        result = calculate_gc_coverage(
+            BAM, sequences, faidx, fixed_length_bin_bp=BIN_BP,
+            min_transcript_cpm=500_001
+        ).collect()
+        assert result.height == 0
+
+    def test_injected_library_size_changes_which_transcripts_survive(self, sequences, faidx):
+        # Each of the two covered transcripts holds one of two fragments, so
+        # 500,000 CPM against the BAM but 2,000 CPM against a library of 500,000.
+        kept = calculate_gc_coverage(
+            BAM, sequences, faidx, fixed_length_bin_bp=BIN_BP,
+            min_transcript_cpm=100_000, library_size=500_000
+        ).collect()
+        assert kept.height == 0
+
+
+class TestReportPath:
+    """Where the JSON report lands, given where the TSV is going."""
+
+    def test_sidecar_beside_a_real_file(self):
+        assert report_path(Path('/tmp/out.tsv')) == Path('/tmp/out.report.json')
+
+    def test_suffixless_output_still_gets_a_sidecar(self):
+        assert report_path(Path('/tmp/out')) == Path('/tmp/out.report.json')
+
+    def test_none_for_dev_stdout(self):
+        # /dev/fd/1 is a regular file under `-o /dev/stdout > out.tsv`, so an
+        # is_file() check would produce a bogus /dev/stdout.report.json.
+        assert report_path(Path('/dev/stdout')) is None
+
+    def test_none_for_dash(self):
+        assert report_path(Path('-')) is None
+
+
+class TestRunReport:
+    """main() writes a JSON report beside every TSV."""
+
+    def _run(self, monkeypatch, outfp, *extra):
+        monkeypatch.setattr(
+            sys, 'argv',
+            ['calculate_gc_coverage', FASTA, BAM, '-o', str(outfp), *extra]
+        )
+        main()
+
+    def _report(self, tmp_path, stem='out'):
+        return json.loads((tmp_path / f'{stem}.report.json').read_text())
+
+    def test_written_beside_the_tsv(self, monkeypatch, tmp_path):
+        self._run(monkeypatch, tmp_path / 'out.tsv')
+        # Two of the four transcripts carry only secondary alignments, so they
+        # never reach the profile even with no depth threshold set.
+        assert self._report(tmp_path)['transcripts'] == {
+            'in_profile': 2, 'in_transcriptome': 4
+        }
+
+    def test_is_pretty_printed(self, monkeypatch, tmp_path):
+        self._run(monkeypatch, tmp_path / 'out.tsv')
+        body = (tmp_path / 'out.report.json').read_text()
+        assert '\n  "tool"' in body and body.endswith('\n')
+
+    def test_records_the_parameters(self, monkeypatch, tmp_path):
+        self._run(monkeypatch, tmp_path / 'out.tsv',
+                  '--min_transcript_cpm', '1', '--fixed_length_bin_bp', '50')
+        parameters = self._report(tmp_path)['parameters']
+        assert parameters['min_transcript_cpm'] == 1.0
+        assert parameters['fixed_length_bin_bp'] == 50
+        assert parameters['min_transcript_read_count'] is None
+
+    def test_a_threshold_that_drops_everything_reports_an_empty_profile(
+        self, monkeypatch, tmp_path
+    ):
+        self._run(monkeypatch, tmp_path / 'out.tsv', '--min_transcript_read_count', '2')
+        assert self._report(tmp_path)['transcripts']['in_profile'] == 0
+
+    def test_empty_profile_writes_a_header_only_tsv(self, monkeypatch, tmp_path):
+        out = tmp_path / 'out.tsv'
+        self._run(monkeypatch, out, '--min_transcript_read_count', '2')
+        assert out.read_text().splitlines() == [
+            'gc_fraction\tmean_normalized_depth\ttranscriptome_bin_count'
+        ]
+
+    def test_empty_profile_keeps_the_full_transcriptome_background(
+        self, monkeypatch, tmp_path
+    ):
+        # The right join against the whole transcriptome survives an empty left
+        # side: every background GC bin stays, with no depth against it.
+        out = tmp_path / 'out.tsv'
+        self._run(monkeypatch, out, '--min_transcript_read_count', '2',
+                  '--report_bin_count_for_full_transcriptome')
+        rows = out.read_text().splitlines()
+        assert rows[0] == (
+            'gc_fraction\tmean_normalized_depth\ttranscriptome_bin_count'
+            '\ttranscriptome_bin_count_all_transcripts'
+        )
+        assert len(rows) == 31
+        assert all(row.split('\t')[1:3] == ['', ''] for row in rows[1:])
