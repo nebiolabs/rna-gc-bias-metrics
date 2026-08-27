@@ -32,6 +32,40 @@ rest of the pipeline (and the tests) working on SAM-style column names/dtypes:
 - There is **no downsampling** — `polars-bio` does not provide it and the
   feature was dropped along with the `--downsample` CLI flag.
 
+## Transcript depth filters (`filter_transcripts_by_depth`)
+
+`--min_transcript_read_count` / `--min_transcript_cpm` drop whole transcripts from
+the profile before `expand_cigar`, counting **fragments**: `(~FPAIRED) | (side ==
+'R1')`. Single-end reads are picked up by `~FPAIRED` rather than by the R1 label,
+because conventional single-end records set no READ1 bit and `load_bam` therefore
+labels them `side` `'R2'`.
+
+The CPM denominator defaults to the fragments surviving `load_bam`'s existing flag
+filters (mapped, non-secondary, non-supplementary, single-end or proper pair).
+**It must be computed before the thresholds are applied** — `pl.col(...).sum()`
+inside a chained `.filter()` would sum the already-filtered frame, so the library
+size would shrink along with the filtering and CPM would stop meaning fragments
+per million sequenced. Likewise **a new read-level filter must run after this
+count**, not before it. `test_cpm_denominator_includes_dropped_transcripts` is the
+guard. The `library_size` argument overrides the denominator outright, for callers
+whose read filters are tunable after load; it is Python-API only, no CLI flag.
+
+The function is **lazy and silent**: no `.collect()`, no `print`, and no raise on
+a threshold nothing clears (that is a tuning outcome, so it yields an empty
+profile). The only raise left is the `library_size <= 0` argument check. Note the
+eagerness that remains in the pipeline lives in `load_bam` (`bam_df.collect()
+.lazy()`), which is why making this function lazy costs and saves nothing here —
+measured at one `pb.scan_bam` call either way. It matters for callers that pass a
+genuinely lazy frame.
+
+`main()` writes a JSON run report beside every TSV (`out.tsv` →
+`out.report.json`, stderr when the TSV is not a regular file). Its transcript
+counts come from frames `main()` already collects — `bin_cov_with_gc`'s distinct
+`rname` and `faidx`'s length — added to the existing `pl.collect_all`, where
+common-subplan elimination computes the pipeline once. **Do not rebuild them from
+a second `load_bam` call**: `load_bam` is eager, so that costs a real second full
+BAM read and CSE cannot help.
+
 ## Reference names (`_normalize_rname`)
 
 The FASTA, the `.fa.fai` and the BAM must agree on `rname`/`RNAME` for the joins

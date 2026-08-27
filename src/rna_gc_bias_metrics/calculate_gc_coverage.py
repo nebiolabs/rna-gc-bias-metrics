@@ -1,5 +1,8 @@
 
 import argparse
+import importlib.metadata
+import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -207,6 +210,76 @@ def load_bam(fp_bam, transcript_categories=None):
 
     return bam_df
 
+
+def get_transcript_fragment_counts(bam_df):
+    '''Count fragments -- not alignments -- per transcript.
+
+    A proper pair contributes one fragment, counted at its R1 mate; a single-end
+    read contributes one. Single-end reads are identified by `~FPAIRED` rather
+    than by the R1 label, because conventional single-end records set no READ1
+    bit (flag 0/16) and so are labelled `side` 'R2' by `load_bam`.
+
+    Example output:
+        rname             | fragment_count
+        ENST00000227525.8 | 1
+        ENST00000438571.5 | 1
+    '''
+    return bam_df.filter(
+        (~pl.col('FPAIRED')) | (pl.col('side') == 'R1')
+    ).group_by(
+        pl.col('RNAME').alias('rname')
+    ).agg(
+        pl.len().alias('fragment_count')
+    )
+
+
+
+def filter_transcripts_by_depth(bam_df, min_read_count=None, min_cpm=None,
+                                library_size=None):
+    '''Drop alignments on transcripts below a fragment-count and/or CPM threshold.
+
+    Thresholds are inclusive (`min_read_count=5` keeps transcripts with 5 or more
+    fragments) and combine with AND. A dropped transcript leaves the profile
+    entirely, zero bins included, because `get_bin_gc` builds its bin grid from
+    whichever transcripts still have coverage. Thresholds that nothing clears give
+    an empty result rather than an error.
+
+    `library_size` overrides the CPM denominator. Left unset, the denominator is
+    every fragment reaching this point: mapped, non-secondary, non-supplementary,
+    and either single-end or properly paired. A caller whose read-level filters
+    are tunable after load has to pin the denominator itself, or CPM stops meaning
+    fragments per million sequenced.
+
+    Example output (input columns, minus alignments on dropped transcripts):
+        QNAME         | FLAG | RNAME             | POS  | MPOS | CIGAR | ISIZE
+        M05473…:12904 | 675  | ENST00000227525.8 | 1451 | 1475 | 75M   | 99
+    '''
+    if library_size is not None and library_size <= 0:
+        raise ValueError(f'library_size must be positive, got {library_size}')
+
+    counts = get_transcript_fragment_counts(bam_df)
+    denominator = (
+        pl.lit(library_size) if library_size is not None
+        else pl.col('fragment_count').sum()
+    )
+    # Taken before the thresholds below: a denominator that shrank along with the
+    # filtering would stop meaning fragments per million sequenced.
+    counts = counts.with_columns(
+        cpm = pl.col('fragment_count') / denominator * 1e6
+    )
+
+    keep = counts
+    if min_read_count is not None:
+        keep = keep.filter(pl.col('fragment_count') >= min_read_count)
+    if min_cpm is not None:
+        keep = keep.filter(pl.col('cpm') >= min_cpm)
+
+    return bam_df.join(
+        keep.select('rname'),
+        left_on='RNAME',
+        right_on='rname',
+        how='semi'
+    )
 
 def expand_cigar(bam_df):
     '''Explode each alignment's CIGAR into one row per reference-consuming match run.
@@ -507,10 +580,17 @@ def plot(bin_cov_with_gc):
     return (lineplot + histplot).cols(1)
 
 
-def calculate_gc_coverage(fp_bam, sequences, faidx, fixed_length_bin_bp=100):
+def calculate_gc_coverage(fp_bam, sequences, faidx, fixed_length_bin_bp=100,
+                          min_transcript_read_count=None, min_transcript_cpm=None,
+                          library_size=None):
     '''Run the full BAM→binned GC-vs-coverage pipeline for one BAM.'''
     transcript_categories = faidx.collect_schema()['rname'].categories
     bam_df = load_bam(fp_bam, transcript_categories=transcript_categories)
+    if min_transcript_read_count is not None or min_transcript_cpm is not None:
+        bam_df = filter_transcripts_by_depth(
+            bam_df, min_transcript_read_count, min_transcript_cpm,
+            library_size=library_size
+        )
     expanded_cigar_df = expand_cigar(bam_df)
     bg = bam_to_bedgraph(expanded_cigar_df)
     bin_cov = get_binned_coverage(bg, fixed_length_bin_bp, faidx)
@@ -577,6 +657,71 @@ def calculate_gc_pct_frequency_across_full_transcriptome(sequences, fixed_length
     }).sort('gc_frac_rounded')
 
 
+def report_path(outfp):
+    '''Sidecar report path beside the TSV, or None when the TSV is not a real file.
+
+    `is_file()` is deliberately not used: under `-o /dev/stdout > out.tsv` the
+    resolved /dev/fd/1 *is* a regular file, which would yield a bogus
+    /dev/stdout.report.json.
+    '''
+    if str(outfp) == '-' or outfp.parent == Path('/dev'):
+        return None
+    return outfp.with_suffix('.report.json')
+
+
+def build_run_report(args, transcripts_in_profile, transcripts_in_transcriptome):
+    '''Provenance for one run, to be written beside the TSV.
+
+    `transcripts.in_profile` counts transcripts holding reads that passed
+    `load_bam`'s flag filters *and* cleared any depth threshold. The two causes of
+    exclusion are not distinguishable from the profile alone.
+
+    Example output:
+        {"tool": {...}, "inputs": {...}, "parameters": {...},
+         "transcripts": {"in_profile": 2, "in_transcriptome": 4}}
+    '''
+    try:
+        version = importlib.metadata.version('rna-gc-bias-metrics')
+    except importlib.metadata.PackageNotFoundError:
+        version = None
+
+    return {
+        'tool': {'name': 'rna-gc-bias-metrics', 'version': version},
+        'inputs': {
+            'fasta': str(args.fp_fasta),
+            'bam': str(args.fp_bam),
+            'output': str(args.outfp),
+        },
+        'parameters': {
+            'fixed_length_bin_bp': args.fixed_length_bin_bp,
+            'min_transcript_read_count': args.min_transcript_read_count,
+            'min_transcript_cpm': args.min_transcript_cpm,
+            'report_bin_count_for_full_transcriptome':
+                args.report_bin_count_for_full_transcriptome,
+        },
+        'transcripts': {
+            'in_profile': transcripts_in_profile,
+            'in_transcriptome': transcripts_in_transcriptome,
+        },
+    }
+
+
+def write_run_report(report, outfp):
+    '''Write the report as pretty JSON beside the TSV, falling back to stderr.'''
+    path = report_path(outfp)
+    if path is not None:
+        try:
+            with path.open('w') as handle:
+                json.dump(report, handle, indent=2)
+                handle.write('\n')
+            return
+        except OSError as error:
+            print(f'could not write {path}: {error}', file=sys.stderr)
+
+    json.dump(report, sys.stderr, indent=2)
+    sys.stderr.write('\n')
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Calculate GC content and coverage from BAM file.'
@@ -604,11 +749,30 @@ def main():
         help='Length of each bin in base pairs (default: 100).'
     )
     parser.add_argument(
+        '--min_transcript_read_count',
+        type=int,
+        default=None,
+        help='Drop transcripts with fewer than this many fragments before calculating '
+             'GC bias. A proper pair counts as one fragment (default: no filter).'
+    )
+    parser.add_argument(
+        '--min_transcript_cpm',
+        type=float,
+        default=None,
+        help='Drop transcripts below this many fragments per million before calculating '
+             'GC bias (default: no filter).'
+    )
+    parser.add_argument(
         '--report_bin_count_for_full_transcriptome',
         action='store_true',
         help='Whether to calculate and report the frequency of each GC percentage bin across the full transcriptome'
     )
     args = parser.parse_args()
+
+    if args.min_transcript_read_count is not None and args.min_transcript_read_count < 0:
+        parser.error('--min_transcript_read_count must be non-negative')
+    if args.min_transcript_cpm is not None and args.min_transcript_cpm < 0:
+        parser.error('--min_transcript_cpm must be non-negative')
 
     fp_faidx = args.fp_fasta.with_suffix('.fa.fai')
     if not fp_faidx.exists():
@@ -621,23 +785,33 @@ def main():
         sequences,
         faidx,
         fixed_length_bin_bp=args.fixed_length_bin_bp,
+        min_transcript_read_count=args.min_transcript_read_count,
+        min_transcript_cpm=args.min_transcript_cpm,
     )
 
-    per_gc_pct_coverage = calculate_gc_pct_coverage(bin_cov_with_gc)
-
-    gc_pct_frequency = calculate_gc_pct_frequency(bin_cov_with_gc)
-
+    # These all derive from frames already being collected, so collecting them
+    # together lets common-subplan elimination compute the pipeline once rather
+    # than once per frame.
+    frames = {
+        'per_gc_pct_coverage': calculate_gc_pct_coverage(bin_cov_with_gc),
+        'gc_pct_frequency': calculate_gc_pct_frequency(bin_cov_with_gc),
+        'transcripts_in_profile': bin_cov_with_gc.select(pl.col('rname').n_unique()),
+        'transcripts_in_transcriptome': faidx.select(pl.len()),
+    }
     if args.report_bin_count_for_full_transcriptome:
-        gc_pct_frequency_all_transcripts = \
-            calculate_gc_pct_frequency_across_full_transcriptome(sequences, args.fixed_length_bin_bp)
+        frames['gc_pct_frequency_all_transcripts'] = \
+            calculate_gc_pct_frequency_across_full_transcriptome(
+                sequences, args.fixed_length_bin_bp
+            )
 
-        per_gc_pct_coverage, gc_pct_frequency, gc_pct_frequency_all_transcripts = pl.collect_all(
-            [per_gc_pct_coverage, gc_pct_frequency, gc_pct_frequency_all_transcripts]
-        )
-    else:
-        per_gc_pct_coverage, gc_pct_frequency = pl.collect_all(
-            [per_gc_pct_coverage, gc_pct_frequency]
-        )
+    collected = dict(zip(frames, pl.collect_all(frames.values())))
+
+    per_gc_pct_coverage = collected['per_gc_pct_coverage']
+    gc_pct_frequency = collected['gc_pct_frequency']
+    transcripts_in_profile = int(collected['transcripts_in_profile'].item())
+    transcripts_in_transcriptome = int(collected['transcripts_in_transcriptome'].item())
+    if args.report_bin_count_for_full_transcriptome:
+        gc_pct_frequency_all_transcripts = collected['gc_pct_frequency_all_transcripts']
 
     output = per_gc_pct_coverage.join(
         gc_pct_frequency,
@@ -666,6 +840,11 @@ def main():
 
     output = output.select(pl.col(output_columns))
     output.write_csv(args.outfp, separator='\t')
+
+    write_run_report(
+        build_run_report(args, transcripts_in_profile, transcripts_in_transcriptome),
+        args.outfp
+    )
 
 if __name__ == "__main__":
     main()
