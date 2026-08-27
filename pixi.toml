@@ -14,7 +14,9 @@ polars = ">=1.37.1"
 # lives here rather than in [dependencies].
 [pypi-dependencies]
 rna-gc-bias-metrics = { path = ".", editable = true }
-polars-bio = ">=0.31"
+# <0.35: 0.35.0 fails to coerce load_bam's `(flags & 2308) == 0` mask
+# (DataFusion "UInt32 AND Int64").
+polars-bio = ">=0.31,<0.35"
 
 [feature.dev.dependencies]
 pytest = ">=9.0"

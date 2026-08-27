@@ -248,7 +248,7 @@ wheels = [
 
 [[package]]
 name = "rna-gc-bias-metrics"
-version = "0.3.0"
+version = "0.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "numpy" },
@@ -265,7 +265,7 @@ dev = [
 requires-dist = [
     { name = "numpy", specifier = ">=2.3.2" },
     { name = "polars", specifier = ">=1.37.1" },
-    { name = "polars-bio", specifier = ">=0.31" },
+    { name = "polars-bio", specifier = ">=0.31,<0.35" },
 ]
 
 [package.metadata.requires-dev]
