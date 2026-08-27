@@ -175,12 +175,11 @@ def build_figure(profiles, bams, runs, theme, title):
             gc = frame['gc_fraction'].to_list()
             counts = frame['transcriptome_bin_count'].to_list()
             style = dict(color=color, width=2, dash=DASHES[run_index])
-            marker = dict(size=8, color=color)
 
             figure.add_trace(go.Scatter(
                 x=gc, y=frame['mean_normalized_depth'].to_list(),
                 name=run, legendgroup=bam, legendgrouptitle_text=bam,
-                mode='lines+markers', line=style, marker=marker,
+                mode='lines', line=style,
                 connectgaps=False, customdata=counts,
                 hovertemplate='%{y:.3f}  (n=%{customdata})<extra>%{fullData.name}</extra>',
             ), row=1, col=1)
@@ -188,7 +187,7 @@ def build_figure(profiles, bams, runs, theme, title):
             figure.add_trace(go.Scatter(
                 x=gc, y=counts,
                 name=run, legendgroup=bam, showlegend=False,
-                mode='lines+markers', line=style, marker=marker,
+                mode='lines', line=style,
                 connectgaps=False,
                 hovertemplate='%{y}<extra>%{fullData.name}</extra>',
             ), row=2, col=1)
