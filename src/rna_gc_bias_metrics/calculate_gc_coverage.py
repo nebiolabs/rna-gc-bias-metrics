@@ -103,7 +103,7 @@ def load_sequences(fp_fasta, fp_faidx):
     return sequences, faidx
 
 
-def load_bam(fp_bam, transcript_categories=None):
+def load_bam(fp_bam, transcript_categories=None, long_read=False):
     '''Read a BAM into a lazy frame with SAM-style columns, flags, and R1/R2 side.
 
     Scans `fp_bam` via polars-bio and drops unmapped/secondary/supplementary
@@ -115,6 +115,10 @@ def load_bam(fp_bam, transcript_categories=None):
     `_normalize_rname`). When `transcript_categories` is given, `RNAME` is
     validated against it (raising if the BAM references sequences absent from the
     FASTA index) and cast to a matching Enum.
+
+    `long_read=True` additionally retains *unpaired* supplementary alignments, the
+    segments a long-read aligner emits for the disjoint stretches of reference one
+    read spans. The output schema is the same in both modes.
 
     Example output:
         QNAME         | FLAG | RNAME             | POS  | MPOS | CIGAR | ISIZE | FPAIRED | FREVERSE | side
@@ -150,9 +154,16 @@ def load_bam(fp_bam, transcript_categories=None):
     flags_to_use = ['FPAIRED', 'FREAD1', 'FREAD2', 'FREVERSE']
     # polars-bio has no read-time flag exclusion, so replicate bam_utils'
     # exclude_flags=2308 (unmapped 4 + secondary 256 + supplementary 2048) as a filter.
+    # Long-read mode drops supplementary (2048) from the mask, leaving 260.
     # use_zero_based=False keeps POS/MPOS 1-based to match the SAM spec (and bam_utils).
+    exclude_flags = 260 if long_read else 2308
     bam_df = pb.scan_bam(str(fp_bam), use_zero_based=False)
-    bam_df = bam_df.filter((pl.col('flags') & 2308) == 0)
+    bam_df = bam_df.filter((pl.col('flags') & exclude_flags) == 0)
+    if long_read:
+        # Admit supplementary alignments only when unpaired
+        bam_df = bam_df.filter(
+            ((pl.col('flags') & 2048) == 0) | ((pl.col('flags') & 1) == 0)
+        )
     # Keep single-end reads (FPAIRED unset, flag bit 1) and proper pairs
     # (FPROPER_PAIR set, flag bit 2); drop paired reads that are not properly
     # paired.
@@ -211,7 +222,7 @@ def load_bam(fp_bam, transcript_categories=None):
     return bam_df
 
 
-def get_transcript_fragment_counts(bam_df):
+def get_transcript_fragment_counts(bam_df, long_read=False):
     '''Count fragments -- not alignments -- per transcript.
 
     A proper pair contributes one fragment, counted at its R1 mate; a single-end
@@ -219,11 +230,25 @@ def get_transcript_fragment_counts(bam_df):
     than by the R1 label, because conventional single-end records set no READ1
     bit (flag 0/16) and so are labelled `side` 'R2' by `load_bam`.
 
+    Under `long_read=True` a fragment is a distinct `QNAME`, which collapses a
+    read's primary and supplementary segments into the one read they came from.
+    A read whose segments land on several transcripts counts once on each, so
+    these counts sum to more than the library size -- see
+    `get_library_fragment_count`, which is why the CPM denominator is taken
+    separately rather than as their sum.
+
     Example output:
         rname             | fragment_count
         ENST00000227525.8 | 1
         ENST00000438571.5 | 1
     '''
+    if long_read:
+        return bam_df.group_by(
+            pl.col('RNAME').alias('rname')
+        ).agg(
+            pl.col('QNAME').n_unique().alias('fragment_count')
+        )
+
     return bam_df.filter(
         (~pl.col('FPAIRED')) | (pl.col('side') == 'R1')
     ).group_by(
@@ -233,9 +258,24 @@ def get_transcript_fragment_counts(bam_df):
     )
 
 
+def get_library_fragment_count(bam_df):
+    '''Count distinct reads across the whole library, as a one-row frame.
+
+    The long-read CPM denominator. Summing `get_transcript_fragment_counts` would
+    count a read once per transcript its segments reach, and CPM would stop
+    meaning fragments per million sequenced.
+
+    Example output:
+        library_fragment_count
+        2
+    '''
+    return bam_df.select(
+        pl.col('QNAME').n_unique().alias('library_fragment_count')
+    )
+
 
 def filter_transcripts_by_depth(bam_df, min_read_count=None, min_cpm=None,
-                                library_size=None):
+                                library_size=None, long_read=False):
     '''Drop alignments on transcripts below a fragment-count and/or CPM threshold.
 
     Thresholds are inclusive (`min_read_count=5` keeps transcripts with 5 or more
@@ -250,6 +290,10 @@ def filter_transcripts_by_depth(bam_df, min_read_count=None, min_cpm=None,
     are tunable after load has to pin the denominator itself, or CPM stops meaning
     fragments per million sequenced.
 
+    `long_read=True` counts fragments by distinct `QNAME` and takes the denominator
+    from `get_library_fragment_count` rather than by summing the per-transcript
+    counts, which would count a multi-transcript read once per transcript.
+
     Example output (input columns, minus alignments on dropped transcripts):
         QNAME         | FLAG | RNAME             | POS  | MPOS | CIGAR | ISIZE
         M05473…:12904 | 675  | ENST00000227525.8 | 1451 | 1475 | 75M   | 99
@@ -257,11 +301,14 @@ def filter_transcripts_by_depth(bam_df, min_read_count=None, min_cpm=None,
     if library_size is not None and library_size <= 0:
         raise ValueError(f'library_size must be positive, got {library_size}')
 
-    counts = get_transcript_fragment_counts(bam_df)
-    denominator = (
-        pl.lit(library_size) if library_size is not None
-        else pl.col('fragment_count').sum()
-    )
+    counts = get_transcript_fragment_counts(bam_df, long_read=long_read)
+    if library_size is not None:
+        denominator = pl.lit(library_size)
+    elif long_read:
+        counts = counts.join(get_library_fragment_count(bam_df), how='cross')
+        denominator = pl.col('library_fragment_count')
+    else:
+        denominator = pl.col('fragment_count').sum()
     # Taken before the thresholds below: a denominator that shrank along with the
     # filtering would stop meaning fragments per million sequenced.
     counts = counts.with_columns(
@@ -582,14 +629,15 @@ def plot(bin_cov_with_gc):
 
 def calculate_gc_coverage(fp_bam, sequences, faidx, fixed_length_bin_bp=100,
                           min_transcript_read_count=None, min_transcript_cpm=None,
-                          library_size=None):
+                          library_size=None, long_read=False):
     '''Run the full BAM→binned GC-vs-coverage pipeline for one BAM.'''
     transcript_categories = faidx.collect_schema()['rname'].categories
-    bam_df = load_bam(fp_bam, transcript_categories=transcript_categories)
+    bam_df = load_bam(fp_bam, transcript_categories=transcript_categories,
+                      long_read=long_read)
     if min_transcript_read_count is not None or min_transcript_cpm is not None:
         bam_df = filter_transcripts_by_depth(
             bam_df, min_transcript_read_count, min_transcript_cpm,
-            library_size=library_size
+            library_size=library_size, long_read=long_read
         )
     expanded_cigar_df = expand_cigar(bam_df)
     bg = bam_to_bedgraph(expanded_cigar_df)
@@ -698,6 +746,7 @@ def build_run_report(args, transcripts_in_profile, transcripts_in_transcriptome)
             'min_transcript_cpm': args.min_transcript_cpm,
             'report_bin_count_for_full_transcriptome':
                 args.report_bin_count_for_full_transcriptome,
+            'long_read': args.long_read,
         },
         'transcripts': {
             'in_profile': transcripts_in_profile,
@@ -767,6 +816,12 @@ def main():
         action='store_true',
         help='Whether to calculate and report the frequency of each GC percentage bin across the full transcriptome'
     )
+    parser.add_argument(
+        '--long_read',
+        action='store_true',
+        help='Treat the BAM as long-read (ONT/PacBio) data: include the supplementary '
+             'alignments. Reads are assumed single-end.'
+    )
     args = parser.parse_args()
 
     if args.min_transcript_read_count is not None and args.min_transcript_read_count < 0:
@@ -787,6 +842,7 @@ def main():
         fixed_length_bin_bp=args.fixed_length_bin_bp,
         min_transcript_read_count=args.min_transcript_read_count,
         min_transcript_cpm=args.min_transcript_cpm,
+        long_read=args.long_read,
     )
 
     # These all derive from frames already being collected, so collecting them

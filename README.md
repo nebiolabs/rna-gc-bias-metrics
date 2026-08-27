@@ -15,7 +15,8 @@ For each transcript the pipeline:
 1. Reads the BAM (via [polars-bio](https://github.com/biodatageeks/polars-bio))
    and drops unmapped, secondary, and supplementary alignments, as well as paired
    reads that are not properly paired (mate-unmapped or discordant mates). Single-end
-   reads and proper pairs are kept.
+   reads and proper pairs are kept. (For long-read data, `--long_read` keeps the
+   supplementary alignments — see [Long-read mode](#long-read-mode).)
 2. Expands each read's CIGAR into the reference positions it covers, and
    deduplicates the overlap between properly paired mates so shared bases are
    counted once.
@@ -100,6 +101,36 @@ uv run python -m rna_gc_bias_metrics.calculate_gc_coverage \
 | `--min_transcript_read_count` | Drop transcripts with fewer than this many fragments before calculating GC bias (default: no filter). |
 | `--min_transcript_cpm` | Drop transcripts below this many fragments per million before calculating GC bias (default: no filter). |
 | `--report_bin_count_for_full_transcriptome` | Also report, per GC fraction, the number of bins across *every* transcript in the FASTA, including transcripts with no coverage at all — the background GC distribution to compare coverage against. |
+| `--long_read` | Treat the BAM as long-read (ONT/PacBio) data: include supplementary alignments and count one fragment per read name (see below). |
+
+### Long-read mode
+
+A long-read aligner represents one read that spans several disjoint stretches of
+reference as a primary alignment plus one or more **supplementary** alignments,
+one per stretch. By default those supplementary records are dropped, so a
+long-read BAM would be profiled from only part of each read. `--long_read` keeps
+them:
+
+```bash
+python -m rna_gc_bias_metrics.calculate_gc_coverage \
+    transcripts.fa reads.bam --long_read -o gc_profile.tsv
+```
+
+Two things change, and nothing else:
+
+- **Supplementary alignments contribute coverage.** Secondary alignments are still
+  dropped either way — a secondary is an alternative placement of sequence already
+  counted at the primary, where a supplementary is a distinct stretch counted
+  nowhere else.
+- **Fragments are counted per read name** rather than per record, so the several
+  records one read occupies collapse back into the one read they came from and the
+  depth filters below keep meaning what they say. For data with no supplementary
+  alignments this is the same count either way, so the flag rescales nothing.
+
+Long reads are single-end. Supplementary alignments that carry the paired flags
+are still dropped, because their coverage would be trimmed against `MPOS` — the
+mate's *primary* start, which says nothing about where a supplementary segment
+lies.
 
 ### Transcript depth filters
 
@@ -115,6 +146,10 @@ Depth is counted in **fragments**, not alignment records: a proper pair counts
 once, and so does a single-end read. The CPM denominator is the total number of
 fragments the tool retains — mapped, non-secondary, non-supplementary, and either
 single-end or properly paired — so CPM sums to 1,000,000 across transcripts.
+Under `--long_read` a fragment is a distinct read name, and a read whose segments
+land on several transcripts counts once on each; the CPM denominator is then the
+number of distinct reads in the library rather than the sum of the per-transcript
+counts, so CPM sums to slightly more than 1,000,000 in that case.
 Thresholds that nothing clears give an empty profile rather than an error, so an
 over-strict setting stays a tuning outcome. How many transcripts reached the
 profile is recorded in the run report (see below).
@@ -134,7 +169,8 @@ sidecar path, so the report goes to stderr instead and the piped TSV stays clean
     "fixed_length_bin_bp": 100,
     "min_transcript_read_count": null,
     "min_transcript_cpm": null,
-    "report_bin_count_for_full_transcriptome": false
+    "report_bin_count_for_full_transcriptome": false,
+    "long_read": false
   },
   "transcripts": {"in_profile": 2, "in_transcriptome": 4}
 }
@@ -222,7 +258,7 @@ sequences, faidx = load_sequences("transcripts.fa", "transcripts.fa.fai")
 bin_cov_with_gc = calculate_gc_coverage(
     "reads.bam", sequences, faidx, fixed_length_bin_bp=100,
     min_transcript_read_count=None, min_transcript_cpm=None,
-    library_size=None,
+    library_size=None, long_read=False,
 )
 
 # mean normalized depth per rounded GC fraction
@@ -240,6 +276,13 @@ emits only bins that received coverage; the zero bins are filled in by `get_bin_
 depth filters and can be applied to a `load_bam` frame directly; both are lazy and
 report nothing, so they compose into a larger query without forcing a collect.
 
+`long_read=True` is accepted by `calculate_gc_coverage`, `load_bam`,
+`get_transcript_fragment_counts` and `filter_transcripts_by_depth`, and must be
+passed consistently: `load_bam` admits the supplementary records, and the counting
+functions are what stop those records each counting as their own fragment.
+`get_library_fragment_count` exposes the long-read CPM denominator (the number of
+distinct read names) on its own.
+
 `library_size` overrides the CPM denominator. Left unset it is the fragment count
 the tool retains, which moves whenever the read-level filters change — a caller
 whose filters are tunable after load should pin it to a library size fixed at load
@@ -252,6 +295,12 @@ argument only; the CLI always computes the denominator from the BAM.
   bases are counted once. Paired reads that are not properly paired (mate-unmapped or discordant
   mates) are dropped.
   Read-through ("dovetail") mate tails past the mate's end are dropped.
+- Under `--long_read`, two segments of the *same* read that overlap in reference
+  space (tandem repeats, concatemers) count that overlap twice. Truly disjoint
+  segments — the ordinary case — are unaffected.
+- There is no MAPQ filter in either mode. This matters most for long-read data,
+  where aligners assign low MAPQ to segments placed among repeats; filter the BAM
+  beforehand if that placement uncertainty matters for your analysis.
 
 ## Development
 

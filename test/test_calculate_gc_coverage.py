@@ -11,6 +11,7 @@ from rna_gc_bias_metrics.calculate_gc_coverage import (
     load_sequences,
     load_bam,
     get_transcript_fragment_counts,
+    get_library_fragment_count,
     filter_transcripts_by_depth,
     expand_cigar,
     bam_to_bedgraph,
@@ -64,6 +65,13 @@ PAIR_OVERLAP_BAM = os.path.join(FIXTURES, 'bam', 'test_pair_overlap.bam')
 PAIR_DEDUP_FASTA = os.path.join(FIXTURES, 'fasta', 'test_pair_dedup.fa')
 PAIR_DEDUP_FAIDX = os.path.join(FIXTURES, 'fasta', 'test_pair_dedup.fa.fai')
 PAIR_DEDUP_BAM = os.path.join(FIXTURES, 'bam', 'test_pair_dedup.bam')
+
+# Three 120bp references (identical sequence: four 30bp blocks at 0%, 100%, 50%
+# and 33% GC) carrying one long-read scenario each -- for TestLongReadMode. The
+# source SAM is checked in beside the BAM at fixtures/sam/test_long_read.sam.
+LONG_READ_FASTA = os.path.join(FIXTURES, 'fasta', 'test_long_read.fa')
+LONG_READ_FAIDX = os.path.join(FIXTURES, 'fasta', 'test_long_read.fa.fai')
+LONG_READ_BAM = os.path.join(FIXTURES, 'bam', 'test_long_read.bam')
 
 
 # ---------------------------------------------------------------------------
@@ -725,24 +733,44 @@ def _alignments(*rows):
     """Build the subset of load_bam's output that the depth filters read."""
     return pl.LazyFrame(
         list(rows),
-        schema={'RNAME': pl.String, 'FPAIRED': pl.Boolean, 'side': pl.String},
+        schema={'QNAME': pl.String, 'RNAME': pl.String,
+                'FPAIRED': pl.Boolean, 'side': pl.String},
         orient='row'
     )
 
 
 def _pairs(rname, n):
-    """`n` proper pairs on `rname`, as the two alignment rows each occupies."""
-    return [(rname, True, 'R1'), (rname, True, 'R2')] * n
+    """`n` proper pairs on `rname`, as the two alignment rows each occupies.
+
+    Both mates share one QNAME, as they do in a real BAM -- long-read mode counts
+    fragments by distinct QNAME, so a per-row name would count each pair twice.
+    """
+    return [
+        row
+        for i in range(n)
+        for row in ((f'{rname}:pair{i}', rname, True, 'R1'),
+                    (f'{rname}:pair{i}', rname, True, 'R2'))
+    ]
 
 
 def _single_end(rname, n):
     """`n` single-end reads on `rname`. load_bam labels these 'R2' (no READ1 bit)."""
-    return [(rname, False, 'R2')] * n
+    return [(f'{rname}:se{i}', rname, False, 'R2') for i in range(n)]
 
 
-def _counts(bam_df):
+def _segments(qname, *rnames):
+    """One long read's alignment rows, one per `rname` given.
+
+    Repeat an rname for two segments on the same transcript, or name two for a
+    read whose segments span both. Supplementary records are unpaired, so these
+    carry the same `~FPAIRED`/'R2' labelling load_bam gives a single-end read.
+    """
+    return [(qname, rname, False, 'R2') for rname in rnames]
+
+
+def _counts(bam_df, **kwargs):
     return dict(
-        get_transcript_fragment_counts(bam_df).collect().iter_rows()
+        get_transcript_fragment_counts(bam_df, **kwargs).collect().iter_rows()
     )
 
 
@@ -909,6 +937,13 @@ class TestRunReport:
         assert parameters['min_transcript_cpm'] == 1.0
         assert parameters['fixed_length_bin_bp'] == 50
         assert parameters['min_transcript_read_count'] is None
+        assert parameters['long_read'] is False
+
+    def test_records_long_read_mode(self, monkeypatch, tmp_path):
+        # Which mode produced a profile is not recoverable from the TSV, and the
+        # two are not comparable, so the sidecar has to carry it.
+        self._run(monkeypatch, tmp_path / 'out.tsv', '--long_read')
+        assert self._report(tmp_path)['parameters']['long_read'] is True
 
     def test_a_threshold_that_drops_everything_reports_an_empty_profile(
         self, monkeypatch, tmp_path
@@ -938,3 +973,135 @@ class TestRunReport:
         )
         assert len(rows) == 31
         assert all(row.split('\t')[1:3] == ['', ''] for row in rows[1:])
+
+
+# ---------------------------------------------------------------------------
+# 16. Long-read mode
+# ---------------------------------------------------------------------------
+class TestLongReadFragmentCounts:
+    """Long-read mode counts a fragment per distinct read name, so the several
+    records one read occupies collapse back into the one read they came from."""
+
+    def test_segments_of_one_read_count_once(self):
+        bam_df = _alignments(*_segments('r1', 'A', 'A', 'A'))
+        assert _counts(bam_df, long_read=True) == {'A': 1}
+
+    def test_read_count_threshold_counts_reads_not_segments(self):
+        # A holds one read in three segments, B two whole reads.
+        bam_df = _alignments(
+            *_segments('r1', 'A', 'A', 'A'), *_segments('r2', 'B'), *_segments('r3', 'B')
+        )
+        assert _kept(bam_df, min_read_count=2, long_read=True) == {'B'}
+
+    def test_read_spanning_two_transcripts_counts_once_on_each(self):
+        assert _counts(_alignments(*_segments('r1', 'A', 'B')), long_read=True) == \
+            {'A': 1, 'B': 1}
+
+    def test_cpm_denominator_counts_a_multi_transcript_read_once(self):
+        # Four reads, one spanning both transcripts, so A holds 1 of 4 -> 250,000
+        # CPM. Summing the per-transcript counts would make the denominator 5 and
+        # A 200,000 CPM, dropping it at a threshold it should clear.
+        bam_df = _alignments(
+            *_segments('r1', 'A', 'B'),
+            *_segments('r2', 'B'), *_segments('r3', 'B'), *_segments('r4', 'B'),
+        )
+        assert get_library_fragment_count(bam_df).collect().item() == 4
+        assert _kept(bam_df, min_cpm=250_000, long_read=True) == {'A', 'B'}
+        assert _kept(bam_df, min_cpm=250_001, long_read=True) == {'B'}
+
+    def test_paired_end_counting_is_unchanged_by_the_flag(self):
+        # The default path counts a proper pair at its R1 record; counting by
+        # distinct QNAME has to agree, or turning the flag on would silently
+        # rescale every threshold for data that has no supplementary records.
+        bam_df = _alignments(*_pairs('A', 5), *_single_end('B', 3))
+        assert _counts(bam_df) == _counts(bam_df, long_read=True) == {'A': 5, 'B': 3}
+
+
+class TestLongReadMode:
+    """Supplementary alignments on the three-reference test_long_read fixture:
+    `disjoint` covers two separate stretches of chrDisjoint, `selfoverlap` two
+    overlapping stretches of chrOverlap, and `pairedsupp` is a proper pair whose
+    supplementary record carries the paired flags."""
+
+    @pytest.fixture(scope="class")
+    def seqs_faidx(self):
+        return load_sequences(LONG_READ_FASTA, LONG_READ_FAIDX)
+
+    def _load(self, seqs_faidx, long_read):
+        _, faidx = seqs_faidx
+        return load_bam(
+            LONG_READ_BAM,
+            transcript_categories=faidx.collect_schema()['rname'].categories,
+            long_read=long_read
+        )
+
+    @pytest.fixture(scope="class")
+    def default_bg(self, seqs_faidx):
+        return bam_to_bedgraph(expand_cigar(self._load(seqs_faidx, False))).collect()
+
+    @pytest.fixture(scope="class")
+    def long_read_bg(self, seqs_faidx):
+        return bam_to_bedgraph(expand_cigar(self._load(seqs_faidx, True))).collect()
+
+    def _spans(self, bg, rname):
+        return list(
+            bg.filter(pl.col('rname') == rname).sort('start')
+            .select('start', 'end', 'depth').iter_rows()
+        )
+
+    def test_default_mode_drops_supplementary_segments(self, default_bg):
+        """Without the flag only the primary survives, so the disjoint read's
+        second stretch of reference is missing from the coverage entirely."""
+        assert self._spans(default_bg, 'chrDisjoint') == [(0, 30, 1)]
+
+    def test_supplementary_segment_contributes_coverage(self, long_read_bg):
+        """Both of the disjoint read's segments cover their stretch at depth 1.
+
+        This also pins the hard-clip arithmetic: the supplementary CIGAR is
+        30H30M at 1-based 61, and H consumes no reference, so its span is
+        [60,90) -- were the 30H counted the segment would land at [90,120), in a
+        reference block of different GC.
+        """
+        assert self._spans(long_read_bg, 'chrDisjoint') == [(0, 30, 1), (60, 90, 1)]
+
+    def test_self_overlapping_segments_double_count(self, long_read_bg):
+        """Accepted limitation: where two segments of one read overlap in reference
+        space (tandem repeats, concatemers) the overlap is counted twice. The
+        segments span 0-based [0,30) and [20,40), so the 10 shared bases carry
+        depth 2 and 50 base-depths fall on 40 distinct bases."""
+        overlap = long_read_bg.filter(pl.col('rname') == 'chrOverlap')
+        assert self._spans(long_read_bg, 'chrOverlap') == [(0, 30, 1), (20, 40, 1)]
+        base_depth = overlap.select(
+            ((pl.col('end') - pl.col('start')) * pl.col('depth')).sum()
+        ).item()
+        assert base_depth == 50
+
+    def test_paired_supplementary_still_dropped(self, long_read_bg):
+        """A supplementary record carrying the paired flags is dropped even in
+        long-read mode: its coverage would be trimmed against MPOS, which is its
+        mate's *primary* start and says nothing about where this segment lies.
+        The pair's two primaries stay; the supplementary at 1-based 81 does not."""
+        assert self._spans(long_read_bg, 'chrPairedSupp') == [(0, 20, 1), (40, 60, 1)]
+
+    def test_fragment_count_collapses_a_read_s_records(self, seqs_faidx):
+        """Each long read occupies two records in the BAM but counts as one
+        fragment, so a threshold of 2 admits neither transcript."""
+        bam_df = self._load(seqs_faidx, True)
+        assert bam_df.filter(pl.col('QNAME') == 'disjoint').collect().height == 2
+        counts = _counts(bam_df, long_read=True)
+        assert counts['chrDisjoint'] == counts['chrOverlap'] == 1
+        assert _kept(bam_df, min_read_count=2, long_read=True) == set()
+
+    def test_end_to_end_profile_covers_both_segments(self, seqs_faidx):
+        """The disjoint read's two segments reach the binned profile: at a 30bp
+        bin its four bins are covered, uncovered, covered, uncovered."""
+        sequences, faidx = seqs_faidx
+        result = calculate_gc_coverage(
+            LONG_READ_BAM, sequences, faidx, fixed_length_bin_bp=30, long_read=True
+        ).collect()
+        disjoint = result.filter(pl.col('rname') == 'chrDisjoint').sort('bin_start')
+        assert disjoint['bin_start'].to_list() == [0, 30, 60, 90]
+        # Each segment fills one 30bp bin exactly, so depth 1 there and 0 between.
+        assert disjoint['depth_fractional'].to_list() == [1.0, 0.0, 1.0, 0.0]
+        # The four 30bp blocks the reference was built from.
+        assert disjoint['gc_frac_rounded'].to_list() == [0.0, 1.0, 0.5, 0.33]

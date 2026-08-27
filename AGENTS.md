@@ -13,6 +13,11 @@ backend. BAM files are loaded into Polars via `polars-bio` (`pb.scan_bam`).
   introduced in commit `f87d09c`; tests and any new callers must use the
   package-qualified import.
 - `test/test_calculate_gc_coverage.py` — pytest suite.
+- `test/fixtures/` — `fasta/`, `bam/`, and `sam/`. The fixture BAMs are
+  hand-written SAM converted with `samtools view -bS | samtools sort`, then
+  `samtools index`. Only `test_long_read.sam` kept its source; for the older BAMs
+  the SAM has to be recovered with `samtools view -h` before a scenario can be
+  edited. Check the source SAM in alongside any new fixture BAM.
 - `pyproject.toml` + `uv.lock` — uv workflow.
 - `pixi.toml` + `pixi.lock` — pixi workflow.
 
@@ -25,7 +30,16 @@ rest of the pipeline (and the tests) working on SAM-style column names/dtypes:
   `POS`/`MPOS` 1-based, matching the SAM spec.
 - `polars-bio` has no read-time flag exclusion, so the old
   `exclude_flags=2308` (unmapped 4 + secondary 256 + supplementary 2048) is
-  replicated as `.filter((pl.col('flags') & 2308) == 0)`.
+  replicated as `.filter((pl.col('flags') & 2308) == 0)`. `long_read=True` drops
+  supplementary from that mask, leaving 260, then filters supplementary records
+  back out unless `FPAIRED` is unset. That guard is what lets `expand_cigar` stay
+  untouched: its `is_left_mate` trim measures against `MPOS`, the mate's *primary*
+  start, which says nothing about where a supplementary segment lies. **Keep
+  supplementary records out of the paired path**, or that trim silently corrupts
+  their coverage. Secondary stays excluded in both modes.
+- Hard clips need no handling. `expand_cigar`'s `\d+[MX=DN]` regex matches only
+  reference-consuming ops, so the `H` runs bracketing every supplementary CIGAR
+  are ignored and the offsets come out right.
 - Columns are renamed `name→QNAME, flags→FLAG, chrom→RNAME, start→POS,
   cigar→CIGAR, mate_start→MPOS, template_length→ISIZE` and cast to the
   expected dtypes (`FLAG→UInt16`, `RNAME→Categorical`; the rest already match).
@@ -49,6 +63,17 @@ per million sequenced. Likewise **a new read-level filter must run after this
 count**, not before it. `test_cpm_denominator_includes_dropped_transcripts` is the
 guard. The `library_size` argument overrides the denominator outright, for callers
 whose read filters are tunable after load; it is Python-API only, no CLI flag.
+
+Under `long_read=True` a fragment is a distinct `QNAME` instead, which collapses a
+read's primary and supplementary records into the one read they came from. The CPM
+denominator then comes from `get_library_fragment_count` (distinct `QNAME` across
+the library), cross-joined in, **not** from summing the per-transcript counts: a
+read whose segments land on two transcripts counts once on each, so that sum
+exceeds the number of reads sequenced. `test_cpm_denominator_counts_a_multi_
+transcript_read_once` is the guard. The two counting paths agree exactly on data
+with no supplementary records, which
+`test_paired_end_counting_is_unchanged_by_the_flag` pins — turning the flag on must
+not rescale existing thresholds.
 
 The function is **lazy and silent**: no `.collect()`, no `print`, and no raise on
 a threshold nothing clears (that is a tuning outcome, so it yields an empty
