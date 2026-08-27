@@ -163,7 +163,7 @@ sidecar path, so the report goes to stderr instead and the piped TSV stays clean
 
 ```json
 {
-  "tool": {"name": "rna-gc-bias-metrics", "version": "0.3.0"},
+  "tool": {"name": "rna-gc-bias-metrics", "version": "0.4.0"},
   "inputs": {"fasta": "transcripts.fa", "bam": "reads.bam", "output": "out.tsv"},
   "parameters": {
     "fixed_length_bin_bp": 100,

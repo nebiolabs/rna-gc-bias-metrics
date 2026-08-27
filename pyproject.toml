@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "rna-gc-bias-metrics"
-version = "0.3.0"
+version = "0.4.0"
 description = "A tool to calculate the GC bias profile of RNAseq data."
 authors = [{name = "Gautam Naishadham"}]
 readme = "README.md"
@@ -14,7 +14,9 @@ requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.3.2",
     "polars>=1.37.1",
-    "polars-bio>=0.31",
+    # <0.35: 0.35.0 fails to coerce load_bam's `(flags & 2308) == 0` mask
+    # (DataFusion "UInt32 AND Int64").
+    "polars-bio>=0.31,<0.35",
 ]
 
 [project.urls]

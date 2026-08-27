@@ -1534,12 +1534,12 @@ packages:
   timestamp: 1787033878899
 - pypi: ./
   name: rna-gc-bias-metrics
-  version: 0.3.0
-  sha256: 4f151d3056b97dd6421799ac0a96255a6e5f5e1980022f4c03cff58679492936
+  version: 0.4.0
+  sha256: 03a65b1468d5d571df0414ca9eb6e1051a80c67c3543310c4c612bcb1e5ed2ca
   requires_dist:
   - numpy>=2.3.2
   - polars>=1.37.1
-  - polars-bio>=0.31
+  - polars-bio>=0.31,<0.35
   requires_python: '>=3.12'
   editable: true
 - conda: https://conda.anaconda.org/conda-forge/linux-64/tk-8.6.13-noxft_h1df4ec4_4.conda
