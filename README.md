@@ -123,9 +123,11 @@ Two things change, and nothing else:
   counted at the primary, where a supplementary is a distinct stretch counted
   nowhere else.
 - **Fragments are counted per read name** rather than per record, so the several
-  records one read occupies collapse back into the one read they came from and the
-  depth filters below keep meaning what they say. For data with no supplementary
-  alignments this is the same count either way, so the flag rescales nothing.
+  records that one read occupies on a transcript only count once for that transcript.
+  Because that collapse is per transcript, a read whose segments land on *different*
+  transcripts counts once on each, which is deliberate but has consequences for CPM — see
+  [Transcript depth filters](#transcript-depth-filters). For data with no supplementary alignments,
+  this is the same count either way, so the flag rescales nothing.
 
 Long reads are single-end. Supplementary alignments that carry the paired flags
 are still dropped, because their coverage would be trimmed against `MPOS` — the
@@ -149,7 +151,16 @@ single-end or properly paired — so CPM sums to 1,000,000 across transcripts.
 Under `--long_read` a fragment is a distinct read name, and a read whose segments
 land on several transcripts counts once on each; the CPM denominator is then the
 number of distinct reads in the library rather than the sum of the per-transcript
-counts, so CPM sums to slightly more than 1,000,000 in that case.
+counts. Those counts therefore sum to more than the library size, and CPM to more
+than 1,000,000. The excess scales with the library's chimera rate, so it is a
+property of the prep rather than a fixed constant. Isoform redundancy does not
+contribute, because two isoforms competing for the same stretch of a read produce
+a secondary alignment, which is dropped.
+
+The excess is not spread evenly, so it cannot be divided out. It falls entirely on
+the transcripts taking part in chimeras, which means both thresholds are at their
+most lenient exactly where the supporting reads are least trustworthy.
+
 Thresholds that nothing clears give an empty profile rather than an error, so an
 over-strict setting stays a tuning outcome. How many transcripts reached the
 profile is recorded in the run report (see below).
