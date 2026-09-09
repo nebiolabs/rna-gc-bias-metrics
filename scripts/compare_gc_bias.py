@@ -5,27 +5,35 @@
 # ///
 '''Compare GC bias profiles produced by two versions of this tool.
 
-Runs `calculate_gc_coverage` at two git refs over the same set of BAMs and
-renders one interactive HTML plot: colour identifies the BAM, line dash
-identifies the run, so a per-sample difference between versions (or between
-parameter sets) is readable at a glance.
+Runs `calculate_gc_coverage` at any number of git refs, each with its own tool
+arguments, over one BAM and renders one interactive HTML plot.
 
-    scripts/compare_gc_bias.py 0.2.0 WORKTREE \
+Each `--run` is `<ref> [tool args...]`, optionally followed by `:: label`:
+
+    scripts/compare_gc_bias.py \
         --fasta transcripts.fa --bam sample.bam \
-        --args-b '--min_transcript_cpm 1'
+        --run 0.2.0 \
+        --run '0.3.0 --min_transcript_read_count 50 :: rc50' \
+        --run 'WORKTREE :: my changes'
 
-Either ref may be WORKTREE, meaning the current checkout including uncommitted
-tracked changes. Passing the same ref twice with different --args-a/--args-b
-turns this into a parameter sweep.
+A ref may be WORKTREE, meaning the current checkout including uncommitted
+tracked changes. Repeating one ref with different arguments turns this into a
+parameter sweep; mixing refs and arguments compares both at once.
+
+Colour identifies the run: hue per version, and within one version a darkening
+step per argument set, so a parameter sweep reads as one family of shades and
+a version difference reads as a change of hue.
 '''
 
 import argparse
 import os
 import shlex
+import string
 import shutil
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 import plotly.graph_objects as go
@@ -34,9 +42,11 @@ from plotly.subplots import make_subplots
 
 WORKTREE_REF = 'WORKTREE'
 
-# Fixed categorical slot order. Hues are assigned in this order and never
-# cycled -- past eight series hue stops carrying identity, so we refuse instead.
-SERIES_COLORS = {
+# One hue per version, assigned in this order and never cycled -- past eight
+# versions hue stops carrying identity, so we refuse instead. Runs sharing a
+# version are darkened from their base hue, which keeps the first run at exactly
+# the categorical colour and every later step higher-contrast, not fainter.
+VERSION_COLORS = {
     'light': ['#2a78d6', '#eb6834', '#1baf7a', '#eda100',
               '#e87ba4', '#008300', '#4a3aa7', '#e34948'],
     'dark': ['#3987e5', '#d95926', '#199e70', '#c98500',
@@ -51,7 +61,15 @@ CHROME = {
 }
 
 FONT_FAMILY = 'system-ui, -apple-system, "Segoe UI", sans-serif'
-DASHES = ['solid', 'dash']
+
+# How far the last run of a version is darkened from its base hue. 0.66 keeps
+# adjacent steps at OKLab dE >= 9 for four runs while the darkest stays in gamut.
+MAX_DARKEN = 0.66
+
+# Beyond this, shades of one hue stop reading as distinct steps.
+MAX_RUNS_PER_VERSION = 5
+
+RUN_SEPARATOR = '::'
 PROFILE_COLUMNS = ['gc_fraction', 'mean_normalized_depth', 'transcriptome_bin_count']
 
 
@@ -140,7 +158,7 @@ def run_tool(worktree, package, fasta, bam, extra_args, tsv):
         die(f'{package}.calculate_gc_coverage failed on {bam.name} in {worktree}')
 
 
-def load_profile(tsv, bam_name, run_label):
+def load_profile(tsv, run_label):
     frame = pl.read_csv(tsv, separator='\t')
     missing = [column for column in PROFILE_COLUMNS if column not in frame.columns]
     if missing:
@@ -149,13 +167,44 @@ def load_profile(tsv, bam_name, run_label):
         pl.col('gc_fraction').cast(pl.Float64, strict=False),
         pl.col('mean_normalized_depth').cast(pl.Float64, strict=False),
         pl.col('transcriptome_bin_count').cast(pl.Int64, strict=False),
-        bam=pl.lit(bam_name),
         run=pl.lit(run_label),
     ).sort('gc_fraction')
 
 
-def build_figure(profiles, bams, runs, theme, title):
-    palette = SERIES_COLORS[theme]
+def darken(color, fraction):
+    '''Scale a #rrggbb colour toward black, keeping its hue.'''
+    channels = (int(color[index:index + 2], 16) for index in (1, 3, 5))
+    return '#' + ''.join(f'{round(channel * (1 - fraction)):02x}'
+                         for channel in channels)
+
+
+def assign_colors(versions, theme):
+    '''Pick one colour per run: hue by version, darkening step within a version.
+
+    `versions` is one key per run, in plot order. Runs sharing a key are taken as
+    the same version and shaded from light to dark in the order given, so listing
+    a sweep in increasing-threshold order makes the shade track the threshold.
+    '''
+    palette = VERSION_COLORS[theme]
+    order = list(dict.fromkeys(versions))
+    if len(order) > len(palette):
+        die(f'at most {len(palette)} versions per plot, since hue identifies the '
+            'version; split the comparison')
+
+    colors = {}
+    for version in order:
+        members = [index for index, value in enumerate(versions) if value == version]
+        if len(members) > MAX_RUNS_PER_VERSION:
+            die(f'at most {MAX_RUNS_PER_VERSION} runs per version, since shade '
+                f'identifies the arguments; {len(members)} given for one version')
+        base = palette[order.index(version)]
+        for position, index in enumerate(members):
+            step = 0 if len(members) == 1 else MAX_DARKEN * position / (len(members) - 1)
+            colors[index] = darken(base, step)
+    return [colors[index] for index in range(len(versions))]
+
+
+def build_figure(profiles, runs, colors, theme, title):
     chrome = CHROME[theme]
 
     figure = make_subplots(
@@ -163,35 +212,38 @@ def build_figure(profiles, bams, runs, theme, title):
         row_heights=[0.72, 0.28], vertical_spacing=0.06,
     )
 
-    for bam_index, bam in enumerate(bams):
-        color = palette[bam_index]
-        for run_index, run in enumerate(runs):
-            frame = profiles.filter(
-                (pl.col('bam') == bam) & (pl.col('run') == run)
-            )
-            if frame.is_empty():
-                continue
+    for run_index, run in enumerate(runs):
+        frame = profiles.filter(pl.col('run') == run)
+        if frame.is_empty():
+            continue
 
-            gc = frame['gc_fraction'].to_list()
-            counts = frame['transcriptome_bin_count'].to_list()
-            style = dict(color=color, width=2, dash=DASHES[run_index])
-            marker = dict(size=8, color=color)
+        gc = frame['gc_fraction'].to_list()
+        counts = frame['transcriptome_bin_count'].to_list()
+        style = dict(color=colors[run_index], width=2)
 
-            figure.add_trace(go.Scatter(
-                x=gc, y=frame['mean_normalized_depth'].to_list(),
-                name=run, legendgroup=bam, legendgrouptitle_text=bam,
-                mode='lines+markers', line=style, marker=marker,
-                connectgaps=False, customdata=counts,
-                hovertemplate='%{y:.3f}  (n=%{customdata})<extra>%{fullData.name}</extra>',
-            ), row=1, col=1)
+        # A run's bin counts scale with how many transcripts cleared its filter,
+        # so raw counts put the runs on incomparable scales and the strictest one
+        # flattens against the axis. Dividing by each run's own total compares the
+        # shape of the distribution instead; the raw count stays in the hover.
+        total = frame['transcriptome_bin_count'].sum()
+        shares = counts if not total else [
+            None if count is None else count / total for count in counts
+        ]
 
-            figure.add_trace(go.Scatter(
-                x=gc, y=counts,
-                name=run, legendgroup=bam, showlegend=False,
-                mode='lines+markers', line=style, marker=marker,
-                connectgaps=False,
-                hovertemplate='%{y}<extra>%{fullData.name}</extra>',
-            ), row=2, col=1)
+        figure.add_trace(go.Scatter(
+            x=gc, y=frame['mean_normalized_depth'].to_list(),
+            name=run, legendgroup=run, mode='lines', line=style,
+            connectgaps=False, customdata=counts,
+            hovertemplate='%{y:.3f}  (n=%{customdata})<extra>%{fullData.name}</extra>',
+        ), row=1, col=1)
+
+        figure.add_trace(go.Scatter(
+            x=gc, y=shares,
+            name=run, legendgroup=run, showlegend=False,
+            mode='lines', line=style,
+            connectgaps=False, customdata=counts,
+            hovertemplate='%{y:.4f}  (n=%{customdata})<extra>%{fullData.name}</extra>',
+        ), row=2, col=1)
 
     # 1.0 is the within-transcript mean, i.e. the no-bias line.
     figure.add_hline(
@@ -210,7 +262,7 @@ def build_figure(profiles, bams, runs, theme, title):
             bgcolor=chrome['surface'], bordercolor=chrome['axis'],
             font=dict(family=FONT_FAMILY, color=chrome['ink']),
         ),
-        legend=dict(groupclick='toggleitem', bgcolor='rgba(0,0,0,0)'),
+        legend=dict(bgcolor='rgba(0,0,0,0)'),
         margin=dict(l=80, r=40, t=80, b=60),
     )
 
@@ -227,7 +279,10 @@ def build_figure(profiles, bams, runs, theme, title):
     figure.update_yaxes(**axis)
     figure.update_xaxes(tickformat='.0%', title_text='GC fraction', row=2, col=1)
     figure.update_yaxes(title_text='Mean normalized depth', row=1, col=1)
-    figure.update_yaxes(title_text='Transcriptome bin count', row=2, col=1)
+    figure.update_yaxes(
+        title_text='Transcriptome bin count<br>(fraction of run total)',
+        tickformat='.3f', row=2, col=1,
+    )
     return figure
 
 
@@ -259,30 +314,60 @@ def default_label(ref, extra_args):
     return f"{ref} ({' '.join(extra_args)})" if extra_args else ref
 
 
+def parse_run_spec(spec):
+    '''Split one --run value into (ref, extra_args, label).
+
+    A spec is `<ref> [tool args...]` with an optional `:: label` suffix, so a
+    single shell word carries a whole run and repeating the option scales to any
+    number of them.
+    '''
+    body, separator, label = spec.partition(RUN_SEPARATOR)
+    tokens = shlex.split(body)
+    if not tokens:
+        die(f'--run {spec!r} names no ref')
+    ref, extra_args = tokens[0], tokens[1:]
+    label = label.strip() if separator else ''
+    return ref, extra_args, label or default_label(ref, extra_args)
+
+
+def disambiguate_labels(labels):
+    '''Suffix repeated labels with an index, so every legend entry is distinct.'''
+    totals = Counter(labels)
+    seen = Counter()
+    result = []
+    for label in labels:
+        if totals[label] == 1:
+            result.append(label)
+            continue
+        seen[label] += 1
+        result.append(f'{label} [{seen[label]}]')
+    return result
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Compare GC bias profiles between two versions of this tool.',
+        description='Compare GC bias profiles across versions and parameter sets.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            'Either ref may be WORKTREE, meaning the current checkout including\n'
-            'uncommitted changes to tracked files.'
+            f'A ref may be {WORKTREE_REF}, meaning the current checkout including\n'
+            'uncommitted changes to tracked files. Example:\n'
+            "  --run 0.2.0 --run '0.3.0 --min_transcript_read_count 50 :: rc50'"
         ),
     )
-    parser.add_argument('ref_a', help=f'First git ref (tag, branch, SHA, or {WORKTREE_REF}).')
-    parser.add_argument('ref_b', help=f'Second git ref (tag, branch, SHA, or {WORKTREE_REF}).')
+    parser.add_argument(
+        '--run', action='append', required=True, metavar='SPEC', dest='runs',
+        help='A run to plot, given as `<ref> [tool args...]` with an optional '
+             f"`{RUN_SEPARATOR} label` suffix. Repeat once per run (minimum two). "
+             f'A ref is a tag, branch, SHA, or {WORKTREE_REF}.'
+    )
     parser.add_argument(
         '--fasta', type=Path, required=True,
         help='Transcript FASTA, indexed. Must be named *.fa, since the tool '
              'derives the index path as <fasta>.with_suffix(".fa.fai").'
     )
     parser.add_argument(
-        '--bam', type=Path, action='append', required=True, metavar='BAM',
-        help='BAM to profile. Repeat for multiple BAMs (max 8).'
+        '--bam', type=Path, required=True, help='The BAM to profile.'
     )
-    parser.add_argument('--args-a', default='', help='Extra CLI arguments for ref_a.')
-    parser.add_argument('--args-b', default='', help='Extra CLI arguments for ref_b.')
-    parser.add_argument('--label-a', help='Legend label for ref_a (default: the ref plus its extra args).')
-    parser.add_argument('--label-b', help='Legend label for ref_b (default: the ref plus its extra args).')
     parser.add_argument(
         '--outdir', type=Path, default=Path('gc_bias_comparison'),
         help='Directory for the TSVs, the manifest and the HTML (default: gc_bias_comparison).'
@@ -316,33 +401,32 @@ def main():
     if not faidx.exists():
         die(f'FASTA index not found: {faidx} (the tool derives this path from the FASTA name)')
 
-    bams = [bam.resolve() for bam in args.bam]
-    for bam in bams:
-        if not bam.exists():
-            die(f'BAM not found: {bam}')
+    bam = args.bam.resolve()
+    if not bam.exists():
+        die(f'BAM not found: {bam}')
 
-    bam_names = [bam.stem for bam in bams]
-    duplicates = {name for name in bam_names if bam_names.count(name) > 1}
-    if duplicates:
-        die(f"BAM file stems must be unique; repeated: {', '.join(sorted(duplicates))}")
-    if len(bams) > len(SERIES_COLORS[args.theme]):
-        die(f'at most {len(SERIES_COLORS[args.theme])} BAMs per plot; split the run')
+    specs = [parse_run_spec(spec) for spec in args.runs]
+    if len(specs) < 2:
+        die('at least two --run specs are needed to have something to compare')
+    refs = [ref for ref, _, _ in specs]
+    extra = [extra_args for _, extra_args, _ in specs]
+    labels = disambiguate_labels([label for _, _, label in specs])
+    if len(labels) > len(string.ascii_lowercase):
+        die(f'at most {len(string.ascii_lowercase)} runs per plot')
+
 
     repo = Path(git(args.repo, 'rev-parse', '--show-toplevel'))
     git(repo, 'worktree', 'prune')
 
-    extra = [shlex.split(args.args_a), shlex.split(args.args_b)]
-    refs = [args.ref_a, args.ref_b]
-    labels = [
-        args.label_a or default_label(refs[0], extra[0]),
-        args.label_b or default_label(refs[1], extra[1]),
-    ]
-    if labels[0] == labels[1]:
-        labels = [f'{labels[0]} [A]', f'{labels[1]} [B]']
-
     shas = [resolve_ref(repo, ref) for ref in refs]
-    if shas[0] == shas[1] and extra[0] == extra[1]:
-        die(f'both refs resolve to {shas[0][:12]} with identical arguments; nothing to compare')
+    colors = assign_colors(shas, args.theme)
+    seen_runs = {}
+    for label, sha, extra_args in zip(labels, shas, extra):
+        identity = (sha, tuple(extra_args))
+        if identity in seen_runs:
+            die(f"'{label}' repeats '{seen_runs[identity]}': same commit {sha[:12]}, "
+                'same arguments; nothing to compare between them')
+        seen_runs[identity] = label
 
     outdir = args.outdir.resolve()
     tsv_dir = outdir / 'tsv'
@@ -361,26 +445,24 @@ def main():
         package = detect_package(worktree)
         note(f'{label}: {sha[:12]} -> {package} at {worktree}')
 
-        run_slug = f'{"ab"[index]}_{slugify(label)}'
-        for bam, bam_name in zip(bams, bam_names):
-            tsv = tsv_dir / f'{run_slug}__{bam_name}.tsv'
-            if tsv.exists() and not args.force:
-                note(f'reusing {tsv} (pass --force to re-run)')
-            else:
-                run_tool(worktree, package, fasta, bam, extra_args, tsv)
-            frames.append(load_profile(tsv, bam_name, label))
-            manifest.append({
-                'run': label, 'ref': ref, 'sha': sha, 'package': package,
-                'extra_args': ' '.join(extra_args), 'bam': str(bam), 'tsv': str(tsv),
-            })
+        tsv = tsv_dir / f'{string.ascii_lowercase[index]}_{slugify(label)}__{bam.stem}.tsv'
+        if tsv.exists() and not args.force:
+            note(f'reusing {tsv} (pass --force to re-run)')
+        else:
+            run_tool(worktree, package, fasta, bam, extra_args, tsv)
+        frames.append(load_profile(tsv, label))
+        manifest.append({
+            'run': label, 'ref': ref, 'sha': sha, 'package': package,
+            'extra_args': ' '.join(extra_args), 'bam': str(bam), 'tsv': str(tsv),
+        })
 
     pl.DataFrame(manifest).write_csv(outdir / 'runs.tsv', separator='\t')
 
     title = (
-        f'GC bias — {labels[0]} (solid) vs {labels[1]} (dashed)'
-        f'<br><span style="font-size:13px">{len(bams)} BAM(s), colour by sample</span>'
+        f'GC bias — {len(labels)} runs, hue by version, shade by arguments'
+        f'<br><span style="font-size:13px">{bam.name}</span>'
     )
-    figure = build_figure(pl.concat(frames), bam_names, labels, args.theme, title)
+    figure = build_figure(pl.concat(frames), labels, colors, args.theme, title)
 
     html = outdir / 'gc_bias.html'
     write_report(figure, html, args.theme)
